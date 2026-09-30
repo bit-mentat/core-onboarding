@@ -1,0 +1,1382 @@
+= 1.0 Bitcoin Core Architecture
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 2
+:icons: font
+:source-highlighter: highlight.js
+:repo: https://github.com/bitcoin/bitcoin/blob/4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+:tree: https://github.com/bitcoin/bitcoin/tree/4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+:pr: https://github.com/bitcoin/bitcoin/pull
+
+[NOTE]
+====
+This is an independently written successor to Chaincode Labs'
+https://github.com/chaincodelabs/bitcoin-core-onboarding/blob/main/1.0_bitcoin_core_architecture.asciidoc[`1.0_bitcoin_core_architecture.asciidoc`],
+whose repository was archived in December 2023. Chaincode's own continuing curriculum
+lives at
+https://github.com/chaincodelabs/onboarding-to-bitcoin-core[chaincodelabs/onboarding-to-bitcoin-core]
+(rendered at https://bitcoincore.academy[bitcoincore.academy]).
+
+Everything below is derived from the tree at the commit pinned in the next section.
+====
+
+== About this document
+
+This document describes the architecture of Bitcoin Core: what the major components
+are, how they communicate, which threads run what, and where in the tree to look. It
+is written for someone opening the repository for the first time, and tries to
+answer the questions you actually have at that point: how does the node find peers,
+what happens when a block arrives, which thread is my breakpoint sitting on, and why
+are there so many executables.
+
+Its companion, `1.1_regions.asciidoc`, covers the *static* layout — which directory
+owns which responsibility. This one covers the *dynamic* picture: processes,
+threads, and the paths that data takes through them.
+
+All references are pinned to commit
+{repo}[`4b612c6bf8cfa319a9df130d4b3d0523fddb6579`] (30 September 2026), which is
+`master` at version `32.99.0` — i.e. v33 development. The v32 branch has been cut
+and is at `v32.0rc2`; v31.1 is the most recent final release. Line-number anchors
+point at that commit, not at `master`, so they stay correct as the tree moves on.
+
+[source,bash]
+----
+git clone https://github.com/bitcoin/bitcoin.git
+cd bitcoin
+git checkout -b arch_text 4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+----
+
+Bitcoin Core is built with CMake. The build options that matter for reading the
+architecture are declared together near the top of
+{repo}/CMakeLists.txt#L103[`CMakeLists.txt`]: `BUILD_BITCOIN_BIN`, `BUILD_DAEMON`,
+`BUILD_GUI`, `BUILD_CLI`, `BUILD_TX`, `BUILD_UTIL`, `ENABLE_WALLET`,
+`BUILD_WALLET_TOOL`, `ENABLE_IPC`, `BUILD_KERNEL_LIB`, and `BUILD_UTIL_CHAINSTATE`.
+Which executables you end up with depends on which of these are on. A plain
+
+[source,bash]
+----
+cmake -B build
+cmake --build build -j$(nproc)
+----
+
+produces the defaults; `cmake -B build -LH` lists every option with its help text.
+
+== Nodes, wallets, and what Bitcoin Core actually is
+
+To participate in the network without trusting anyone, you need a node: software
+that downloads the block chain, independently enforces the consensus rules, and
+validates and relays transactions. If you delegate that job to someone else's node,
+you inherit their view of the chain and leak your transaction interests to them.
+
+A wallet is a different thing. It manages private keys, derives addresses, tracks
+which outputs you can spend, and produces signatures. The protocol has no concept of
+accounts; a wallet is bookkeeping over a set of keys and the UTXOs they control.
+
+These two concerns are logically separate even though they ship in one project, and
+often in one binary. Keeping them distinct in your head is most of the work of
+understanding the codebase. The code enforces the separation too: the wallet talks
+to the node only through an abstract interface (`interfaces::Chain`), never by
+reaching into node internals, which is what makes it possible to run them in
+separate processes.
+
+Bitcoin Core bundles a node, a wallet, a Qt GUI, and a command-line client.
+Wallets are not created automatically; you create them explicitly with
+`createwallet`. Only descriptor wallets (stored in SQLite) are supported;
+{repo}/src/wallet/migrate.cpp[`src/wallet/migrate.cpp`] exists solely to read old
+Berkeley DB wallet files so they can be migrated.
+
+== Executables
+
+=== The monolithic binaries
+
+`bitcoind`:: {repo}/src/bitcoind.cpp[`src/bitcoind.cpp`]. The node daemon. Starts
+the P2P node, the validation engine, the indexes, the JSON-RPC server, the
+(unauthenticated, limited) {repo}/doc/REST-interface.md[REST interface], and
+optionally the wallet. `main()` calls
+{repo}/src/bitcoind.cpp#L169[`AppInit(...)`], which in turn calls
+{repo}/src/init.cpp#L1490[`AppInitMain(...)`] — the function where nearly every
+subsystem and thread is brought up. If you read only one function to orient
+yourself, read that one, top to bottom.
+
+`bitcoin-qt`:: {repo}/src/qt/main.cpp[`src/qt/main.cpp`]. Everything `bitcoind`
+does, plus the Qt GUI, in one process. Only one of `bitcoind` and `bitcoin-qt` can
+use a given data directory at a time; the data directory is locked on startup.
+
+`bitcoin-cli`:: {repo}/src/bitcoin-cli.cpp[`src/bitcoin-cli.cpp`]. Sends
+{repo}/doc/JSON-RPC-interface.md[JSON-RPC] requests to a running node and prints the
+result. It normally speaks HTTP, but can also reach a multiprocess node over its IPC
+socket (see below).
+
+`bitcoin-tx`:: {repo}/src/bitcoin-tx.cpp[`src/bitcoin-tx.cpp`]. Offline creation and
+editing of hex-encoded raw transactions.
+
+`bitcoin-util`:: {repo}/src/bitcoin-util.cpp[`src/bitcoin-util.cpp`]. Offline
+utility for things like block header grinding.
+
+`bitcoin-wallet`:: {repo}/src/bitcoin-wallet.cpp[`src/bitcoin-wallet.cpp`]. Offline
+wallet file tool: create, inspect, dump, and migrate wallets without a node running.
+
+=== The `bitcoin` wrapper
+
+{repo}/src/bitcoin.cpp[`src/bitcoin.cpp`] builds a single front-end executable,
+`bitcoin`, that dispatches to the others. Its
+{repo}/src/bitcoin.cpp#L23[usage string] is the clearest one-screen summary of the
+whole executable layout:
+
+[source,text]
+----
+Options:
+  -m, --multiprocess     Run multiprocess binaries bitcoin-node, bitcoin-gui.
+  -M, --monolithic       Run monolithic binaries bitcoind, bitcoin-qt. (Default behavior)
+  -v, --version          Show version information
+  -h, --help             Show full help message
+
+Commands:
+  gui [ARGS]     Start GUI, equivalent to running 'bitcoin-qt [ARGS]' or 'bitcoin-gui [ARGS]'.
+  node [ARGS]    Start node, equivalent to running 'bitcoind [ARGS]' or 'bitcoin-node [ARGS]'.
+  rpc [ARGS]     Call RPC method, equivalent to running 'bitcoin-cli -named [ARGS]'.
+  wallet [ARGS]  Call wallet command, equivalent to running 'bitcoin-wallet [ARGS]'.
+  tx [ARGS]      Manipulate hex-encoded transactions, equivalent to running 'bitcoin-tx [ARGS]'.
+  help           Show full help message.
+----
+
+So `bitcoin node -signet` and `bitcoind -signet` are the same thing, and
+`bitcoin -m node` selects the multiprocess build of the node instead. `bitcoin help`
+additionally lists `bench`, `chainstate`, `test`, and `test-gui` for the developer
+executables.
+
+=== Multiprocess binaries and IPC
+
+{repo}/CMakeLists.txt#L122[`ENABLE_IPC`] defaults to `ON` on non-Windows platforms
+and builds two additional executables:
+
+`bitcoin-node`:: {repo}/src/init/bitcoin-node.cpp[`src/init/bitcoin-node.cpp`]. The
+node, indexes, wallet, and JSON-RPC server, able to expose an IPC socket.
+
+`bitcoin-gui`:: {repo}/src/qt/CMakeLists.txt#L276[`src/qt/CMakeLists.txt`]. The GUI
+built with IPC support.
+
+It is important to be precise about what these do *today*, because the design
+documents describe where the project is heading as well as where it is. Per
+{repo}/doc/multiprocess.md[`doc/multiprocess.md`], the multiprocess binaries
+currently function the same as the monolithic ones, except that they accept
+`-ipcbind`. `bitcoin-gui` still runs the node in its own process; splitting the GUI,
+node, and wallet into separate processes that talk over socket pairs is the stated
+end goal, not the current behaviour.
+
+What IPC *is* used for right now is letting other local programs talk to a running
+node:
+
+* `bitcoin-node -ipcbind=unix` listens on `<datadir>/node.sock`
+  ({repo}/src/init.cpp#L753[`-ipcbind`]). Nothing listens by default. Anyone who can
+  open that socket gets unauthenticated access, so its filesystem permissions are
+  the security boundary.
+* `bitcoin-cli` tries that socket first
+  ({repo}/src/bitcoin-cli.cpp#L180[`-ipcconnect`], default `auto`) and falls back to
+  HTTP if it is not there. Requests travel through
+  {repo}/src/interfaces/rpc.h#L19[`interfaces::Rpc`], which emulates an HTTP RPC
+  call on the node side.
+* Mining software — the intended first user is a Stratum v2 template provider —
+  connects and drives {repo}/src/interfaces/mining.h#L107[`interfaces::Mining`].
+
+The mechanism is Cap'n Proto over a Unix socket, with
+https://github.com/bitcoin-core/libmultiprocess[libmultiprocess] vendored as a git
+subtree under {tree}/src/ipc/libmultiprocess[`src/ipc/libmultiprocess`]. The moving
+parts:
+
+* {tree}/src/interfaces[`src/interfaces/`] — abstract C++ classes
+  (`interfaces::Node`, `Chain`, `WalletLoader`, `Mining`, `Rpc`, `Init`, `Ipc`,
+  `Echo`) with pure virtual methods. Code in `src/node/`, `src/wallet/`, and
+  `src/qt/` calls across component boundaries *only* through these, which is what
+  makes the same call work in-process or across a socket.
+* {tree}/src/ipc/capnp[`src/ipc/capnp/`] — `.capnp` schemas (currently `init`,
+  `echo`, `mining`, `rpc`, plus `common`) and the glue that lets the code generator
+  turn those interfaces into serialisable requests. An interface only works across
+  processes once it has a schema here.
+* {repo}/src/ipc/process.cpp[`src/ipc/process.cpp`] — spawning child processes.
+  A spawned child is passed exactly `-ipcchild <socket>` and connects back to its
+  parent over that inherited socket.
+* {tree}/src/init[`src/init/`] — one small translation unit per executable
+  (`bitcoind.cpp`, `bitcoin-node.cpp`, `bitcoin-qt.cpp`, `bitcoin-gui.cpp`,
+  `bitcoin-wallet.cpp`, `basic.cpp`), each implementing `interfaces::Init` to decide
+  which interfaces that executable can provide locally.
+
+When IPC is active, Cap'n Proto runs its event loop on a dedicated thread named
+`b-capnp-loop` ({repo}/src/ipc/capnp/protocol.cpp#L133[`protocol.cpp`]); all
+socket I/O for IPC happens there. `-debug=ipc` logs every request and response. The
+full design rationale is in
+{repo}/doc/design/multiprocess.md[`doc/design/multiprocess.md`].
+
+=== The kernel library
+
+{tree}/src/kernel[`src/kernel/`] contains `libbitcoin_kernel`: the validation engine
+factored out from the rest of the node, with a C API in
+{repo}/src/kernel/bitcoinkernel.h[`kernel/bitcoinkernel.h`] and a C++ RAII wrapper in
+{repo}/src/kernel/bitcoinkernel_wrapper.h[`bitcoinkernel_wrapper.h`]. It is
+experimental — gated behind `BUILD_KERNEL_LIB` — and the demonstration consumer is
+{repo}/src/bitcoin-chainstate.cpp[`bitcoin-chainstate`], which validates blocks with
+no P2P, wallet, or RPC involved. This is the most useful entry point in the tree if
+you want to read validation in isolation.
+
+Note which things live in `kernel/`: chain parameters
+({repo}/src/kernel/chainparams.cpp[`kernel/chainparams.cpp`], which is also where the
+DNS seeds are listed), mempool options and limits, the `kernel::Notifications`
+interface, and `cs_main` itself ({repo}/src/kernel/cs_main.h[`kernel/cs_main.h`]).
+
+=== Library layout
+
+{repo}/doc/design/libraries.md[`doc/design/libraries.md`] is authoritative and has a
+Mermaid dependency graph. The convention worth memorising: each library has a
+directory and a namespace — `libbitcoin_node` in `src/node/` as `node::`,
+`libbitcoin_wallet` in `src/wallet/` as `wallet::`, `libbitcoin_ipc` in `src/ipc/`
+as `ipc::`, `libbitcoin_util` in `src/util/` as `util::`, `libbitcoin_consensus` in
+`src/consensus/` as `Consensus::`. Every library except `libbitcoin_kernel` has a
+deliberately unstable API — nothing outside the repository should link against
+them.
+
+== Protocol — P2P
+
+=== Message types
+
+{repo}/src/protocol.h#L60[`namespace NetMsgType`] in
+{repo}/src/protocol.h[`src/protocol.h`] declares every wire message type, each with a
+comment describing its purpose. It is the best one-page reference for the P2P
+vocabulary:
+
+[source,cpp]
+----
+namespace NetMsgType {
+/**
+ * The version message provides information about the transmitting node to the
+ * receiving node at the beginning of a connection.
+ */
+inline constexpr const char* VERSION{"version"};
+// ...
+inline constexpr const char* ADDRV2{"addrv2"};
+inline constexpr const char* SENDADDRV2{"sendaddrv2"};
+// ...
+} // namespace NetMsgType
+----
+
+The full set is: `version`, `verack`, `addr`, `addrv2`, `sendaddrv2`, `inv`,
+`getdata`, `merkleblock`, `getblocks`, `getheaders`, `tx`, `headers`, `block`,
+`getaddr`, `mempool`, `ping`, `pong`, `notfound`, `filterload`, `filteradd`,
+`filterclear`, `sendheaders`, `feefilter`, `sendcmpct`, `cmpctblock`, `getblocktxn`,
+`blocktxn`, the BIP157 compact filter messages (`getcfilters`, `cfilter`,
+`getcfheaders`, `cfheaders`, `getcfcheckpt`, `cfcheckpt`), `wtxidrelay` (BIP339),
+`sendtxrcncl` (Erlay reconciliation), and
+{repo}/src/protocol.h#L270[`feature`] — a generic post-`version` feature-negotiation
+message bounded by {repo}/src/protocol.h#L313[`MAX_FEATUREID_LENGTH`] and
+`MAX_FEATUREDATA_LENGTH`, with an as-yet-empty `NetMsgFeature` namespace waiting for
+its first user.
+
+Anything added to `NetMsgType` must also be added to
+{repo}/src/protocol.h#L274[`ALL_NET_MESSAGE_TYPES`], in the same order.
+
+Not visible in `protocol.h` at all: the BIP324 v2 encrypted transport, implemented in
+{repo}/src/bip324.cpp[`src/bip324.cpp`] and
+{repo}/src/net.h#L458[`V2Transport`], which encrypts the message stream and hides
+even the message types from an on-path observer. BIP324 is negotiated per
+connection and falls back to the classic v1 framing when the peer does not support
+it; everything above the transport sees the same deserialised messages either way.
+
+=== Finding peers
+
+On a first run the node has no peers, so it queries hardcoded DNS seeds, each of
+which returns addresses of recently-live nodes. They are listed in
+{repo}/src/kernel/chainparams.cpp#L168[`src/kernel/chainparams.cpp`] (comments
+abridged here):
+
+[source,cpp]
+----
+vSeeds.emplace_back("dnsseed.bluematt.me.");             // Matt Corallo, only supports x9
+vSeeds.emplace_back("seed.bitcoin.jonasschnelli.ch.");   // Jonas Schnelli
+vSeeds.emplace_back("seed.btc.petertodd.net.");          // Peter Todd
+vSeeds.emplace_back("seed.bitcoin.sprovoost.nl.");       // Sjors Provoost
+vSeeds.emplace_back("dnsseed.emzy.de.");                 // Stephan Oeste
+vSeeds.emplace_back("seed.bitcoin.wiz.biz.");            // Jason Maurice
+vSeeds.emplace_back("seed.mainnet.achownodes.xyz.");     // Ava Chow
+----
+
+The `x9`, `x49` and similar annotations in the full comments are *service-bit
+filters*: a seed that supports `x9` can be asked specifically for nodes advertising
+`NODE_NETWORK | NODE_WITNESS`. Testnet3, testnet4, and signet have their own seed
+lists further down the same file. If DNS fails too, the node falls back to a list of
+fixed seed addresses compiled into the binary (`-fixedseeds`).
+
+Learned addresses are managed by {repo}/src/addrman.h[`AddrMan`] and persisted to
+`peers.dat`; the seed query is a bootstrap of last resort, skipped entirely if
+`-dnsseed=0` or if enough addresses are already known. Peers can also be pinned
+manually with `-addnode=<addr>` or `-connect=<ip>`, and `-seednode` provides a
+one-shot address source.
+
+=== Connection limits
+
+Defined in {repo}/src/net.h#L69[`src/net.h`]:
+
+[source,cpp]
+----
+inline constexpr int MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 8;
+inline constexpr int MAX_ADDNODE_CONNECTIONS = 8;
+inline constexpr int MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2;
+inline constexpr int MAX_FEELER_CONNECTIONS = 1;
+inline constexpr size_t MAX_PRIVATE_BROADCAST_CONNECTIONS{64};
+inline constexpr unsigned int DEFAULT_MAX_PEER_CONNECTIONS{200};
+inline constexpr int DEFAULT_FULL_RELAY_INBOUND_PCT{50};
+----
+
+{repo}/src/net.h#L1118[`CConnman::Init(...)`] derives the rest: 8 full-relay + 2
+block-relay-only + 1 feeler = 11 automatic outbound connections, with the remainder
+of the `-maxconnections` budget (default 200) available for inbound. Of those
+inbound slots, at most {repo}/src/net.h#L83[`-inboundrelaypercent`] (default 50%)
+may be occupied by peers that relay transactions; when that share is exceeded, the
+node evicts a transaction-relaying inbound peer (`EvictTxPeerIfFull`). Inbound peers
+that do not relay transactions — block-relay-only clients — cost far less memory,
+so they are allowed to fill the remainder.
+
+The connection types are worth knowing by name because they show up in
+`getpeerinfo` and throughout `net_processing`:
+
+* *full-relay* outbound — the default: blocks, transactions, and addresses.
+* *block-relay-only* outbound — blocks only, no transactions or addresses. Harder
+  for an observer to discover, which makes them the backbone of eclipse-attack
+  resistance.
+* *feeler* — short-lived connections that test whether an address in `AddrMan` is
+  reachable, then disconnect.
+* *addrfetch* — short-lived connections to fetch addresses, used for `-seednode`.
+* *manual* — from `-addnode`/`-connect`/`addnode` RPC; exempt from several
+  eviction and disconnection rules.
+* *private broadcast* — see <<private-broadcast>>.
+
+`MAX_PRIVATE_BROADCAST_CONNECTIONS` bounds the last of these.
+
+== Concurrency model
+
+The node does many things at once: syncing headers and blocks, validating them,
+accepting and relaying transactions, serving RPC, responding to GUI events. It is
+heavily multithreaded, and the single most useful fact for a newcomer is that
+*almost all `net_processing` and validation logic runs on one thread* — `b-msghand`.
+Parallelism is concentrated in a few specific places (script checks, prevout
+fetching, RPC workers, index sync), not spread across the codebase. When you are
+reading `net_processing.cpp` or `validation.cpp`, assume single-threaded execution
+under `cs_main` unless the code tells you otherwise.
+
+Thread names are set by `util::ThreadRename` and carry a `b-` prefix in the OS view,
+which is what you see in `gdb`'s `info threads` or `top -H`. Most threads are started
+directly or indirectly from {repo}/src/init.cpp#L1490[`AppInitMain(...)`]; the
+network threads are started from
+{repo}/src/net.cpp#L3560[`CConnman::Start(...)`], which `AppInitMain` calls.
+
+.Threads in a running node
+[cols="2,3,1,3",options="header"]
+|===
+| OS name | Task | Count | Started in
+
+| `b-scriptch.NN`
+| {repo}/src/checkqueue.h#L73[`CCheckQueue::Loop`] — parallel script verification
+| `-par`, up to 15
+| {repo}/src/checkqueue.h#L145[`CCheckQueue` constructor]
+
+| `b-prevout.NN`
+| parallel prevout fetch for `ConnectBlock`
+| `-prevoutfetchthreads`, default 8, max 16
+| {repo}/src/validation.cpp#L1850[`CoinsViews::InitCache`]
+
+| `b-initload`
+| {repo}/src/node/blockstorage.cpp#L1270[`ImportBlocks`], chain activation, index sync start, mempool load
+| 1
+| {repo}/src/init.cpp#L2096[`AppInitMain`]
+
+| `b-http`
+| {repo}/src/httpserver.cpp#L1049[`HTTPServer::ThreadSocketHandler`]
+| 1
+| {repo}/src/httpserver.cpp#L808[`StartSocketsThreads`]
+
+| `b-http.NN`
+| RPC/REST request workers
+| `-rpcthreads`, default 16
+| {repo}/src/httpserver.cpp#L1387[`StartHTTPServer`]
+
+| `b-scheduler`
+| {repo}/src/scheduler.cpp#L23[`CScheduler::serviceQueue`]
+| 1
+| {repo}/src/init.cpp#L1526[`AppInitMain`]
+
+| `b-net`
+| {repo}/src/net.cpp#L2273[`CConnman::ThreadSocketHandler`]
+| 1
+| {repo}/src/net.cpp#L3624[`CConnman::Start`]
+
+| `b-dnsseed`
+| {repo}/src/net.cpp#L2293[`CConnman::ThreadDNSAddressSeed`]
+| 0–1
+| {repo}/src/net.cpp#L3629[`CConnman::Start`]
+
+| `b-addcon`
+| {repo}/src/net.cpp#L3055[`CConnman::ThreadOpenAddedConnections`]
+| 1
+| {repo}/src/net.cpp#L3632[`CConnman::Start`]
+
+| `b-opencon`
+| {repo}/src/net.cpp#L2595[`CConnman::ThreadOpenConnections`]
+| 0–1
+| {repo}/src/net.cpp#L3644[`CConnman::Start`]
+
+| `b-msghand`
+| {repo}/src/net.cpp#L3219[`CConnman::ThreadMessageHandler`]
+| 1
+| {repo}/src/net.cpp#L3649[`CConnman::Start`]
+
+| `b-i2paccept`
+| {repo}/src/net.cpp#L3260[`CConnman::ThreadI2PAcceptIncoming`]
+| 0–1
+| {repo}/src/net.cpp#L3653[`CConnman::Start`]
+
+| `b-privbcast`
+| {repo}/src/net.cpp#L3305[`CConnman::ThreadPrivateBroadcast`]
+| 0–1
+| {repo}/src/net.cpp#L3658[`CConnman::Start`]
+
+| `b-torcontrol`
+| `TorController::ThreadControl`
+| 0–1
+| {repo}/src/torcontrol.cpp#L364[`TorController`]
+
+| `b-mapport`
+| `ThreadMapPort` (PCP/NAT-PMP port mapping)
+| 0–1
+| {repo}/src/mapport.cpp#L134[`StartMapPort`]
+
+| `b-txidx`, `b-blkfltbscidx`, `b-coinstatsidx`, `b-txospenderidx`
+| `BaseIndex::Sync`
+| 1 per enabled index
+| {repo}/src/index/base.cpp#L473[`BaseIndex::StartBackgroundSync`]
+
+| `b-capnp-loop`
+| Cap'n Proto event loop for IPC
+| 0–1
+| {repo}/src/ipc/capnp/protocol.cpp#L133[`startLoop`]
+|===
+
+In addition, the main thread itself (`bitcoind` or `bitcoin-qt`) runs startup and
+shutdown and otherwise waits; and short-lived unnamed threads are spawned to run the
+user's `-blocknotify`, `-alertnotify`, `-shutdownnotify`, and `-walletnotify`
+commands.
+
+[TIP]
+====
+{repo}/doc/developer-notes.md#L721[`doc/developer-notes.md`] carries its own thread
+list, with links into the Doxygen output. It is worth reading, but it does not list
+`b-privbcast`, `b-prevout.NN`, or `b-capnp-loop`. When the docs and the code
+disagree, `git grep -n "TraceThread\|ThreadRename" -- src/` settles it.
+====
+
+=== `util::TraceThread`
+
+Almost every long-lived thread is wrapped in
+{repo}/src/util/thread.h[`util::TraceThread`], defined in
+{repo}/src/util/thread.cpp#L15[`src/util/thread.cpp`]. It renames the thread, logs
+its start and exit, and makes sure an escaping exception is logged with the thread's
+name before it propagates (and, since it escapes a thread function, terminates the
+process):
+
+[source,cpp]
+----
+void util::TraceThread(std::string_view thread_name, std::function<void()> thread_func)
+{
+    util::ThreadRename(std::string{thread_name});
+    try {
+        LogInfo("%s thread start", thread_name);
+        thread_func();
+        LogInfo("%s thread exit", thread_name);
+    } catch (const std::exception& e) {
+        PrintExceptionContinue(&e, thread_name);
+        throw;
+    } catch (...) {
+        PrintExceptionContinue(nullptr, thread_name);
+        throw;
+    }
+}
+----
+
+Call sites pass it as the callable to `std::thread`, with a lambda for the body:
+
+[source,cpp]
+----
+threadSocketHandler = std::thread(&util::TraceThread, "net", [this] { ThreadSocketHandler(); });
+----
+
+The name "trace thread" might suggest run-once semantics, and the wrapper does call
+its function exactly once — but the functions themselves contain a loop that runs
+until interrupted, so a single call keeps the thread alive for the node's lifetime.
+`ThreadSocketHandler` is the canonical example:
+
+[source,cpp]
+----
+void CConnman::ThreadSocketHandler()
+{
+    AssertLockNotHeld(m_total_bytes_sent_mutex);
+
+    while (!m_interrupt_net->interrupted()) {
+        DisconnectNodes();
+        NotifyNumConnectionsChanged();
+        SocketHandler();
+    }
+}
+----
+
+The two exceptions to the wrapper are the script-check workers, which call
+`util::ThreadRename("scriptch.NN")` directly, and the Cap'n Proto loop thread, which
+does the same with `"capnp-loop"`.
+
+=== Interrupting threads
+
+Two different interrupt types appear throughout the tree, and it helps to know
+which is which.
+
+{repo}/src/util/threadinterrupt.h#L25[`CThreadInterrupt`] is a flag plus a condition
+variable: `interrupted()` reads the flag, `operator()` sets it, and `sleep_for(d)`
+sleeps for up to `d` but wakes immediately if interrupted, returning `false`. The
+network threads share one, held as
+{repo}/src/net.h#L1765[`const std::shared_ptr<CThreadInterrupt> m_interrupt_net`].
+It is a `shared_ptr` because the I2P SAM session holds a copy too, so shutting down
+the network also aborts any I2P handshake in progress. Idioms like
+`if (!m_interrupt_net->sleep_for(500ms)) return;` are how every network loop backs
+off without delaying shutdown.
+
+{repo}/src/util/signalinterrupt.h[`util::SignalInterrupt`] is the node-wide
+shutdown request, held by `NodeContext::shutdown_signal`. Unlike
+`CThreadInterrupt`, it is safe to trigger from a POSIX signal handler (on Unix it
+uses the self-pipe trick rather than a mutex), which is how Ctrl-C and `SIGTERM`
+reach the node. `ChainstateManager` holds a reference to it as `m_interrupt` so
+that long operations such as reindex can check it and unwind.
+
+=== `util::ThreadPool`
+
+{repo}/src/util/threadpool.h#L47[`util::ThreadPool`] is a general worker pool with
+`Start`, `Interrupt`, `Stop`, and a task queue returning futures. Workers are
+themselves wrapped in `TraceThread` and named `<pool>.NN`:
+
+[source,cpp]
+----
+for (int i = 0; i < num_workers; i++) {
+    m_workers.emplace_back(&util::TraceThread, strprintf("%s.%02d", m_name, i), [this] { WorkerThread(); });
+}
+----
+
+`Interrupt()` stops new submissions but lets queued tasks drain in the background;
+`Stop()` also blocks until they finish. Two pools exist: the HTTP worker pool
+({repo}/src/httpserver.cpp#L75[`g_threadpool_http`]) and the prevout-fetching pool
+owned by `CoinsViewOverlay`.
+
+=== Script verification
+
+Script execution itself is
+{repo}/src/script/interpreter.cpp[`VerifyScript(...)`] in
+`src/script/interpreter.cpp`. Everything that needs to check an input's script goes
+through {repo}/src/validation.cpp#L2060[`CheckInputScripts(...)`], reached from
+three directions:
+
+. A transaction arrives from a peer. `net_processing` calls
+  {repo}/src/validation.cpp#L4463[`ChainstateManager::ProcessTransaction(...)`]
+  (or {repo}/src/validation.h#L287[`ProcessNewPackage(...)`] for a package), which
+  runs the `MemPoolAccept` pipeline. `ProcessTransaction` is a thin front door over
+  {repo}/src/validation.h#L273[`AcceptToMemoryPool`], which validation also calls
+  internally — for example to put transactions from disconnected blocks back into
+  the mempool during a reorg.
+. The node submits a transaction of its own — from the wallet or from
+  `sendrawtransaction` — through
+  {repo}/src/node/transaction.cpp#L34[`BroadcastTransaction(...)`], which first
+  enforces the caller's maximum fee and fee rate, then goes through the same
+  pipeline.
+. A block arrives: `ChainstateManager::ProcessNewBlock` →
+  `ActivateBestChain` → `ConnectTip` →
+  {repo}/src/validation.cpp#L2294[`Chainstate::ConnectBlock(...)`].
+
+Before doing any work, `CheckInputScripts` consults the *script execution cache*:
+a hash of the transaction's witness txid plus the verification flags. If this exact
+transaction has already passed under these exact flags — typically because it was
+validated on entry to the mempool — its scripts are not executed again when it
+appears in a block. This is why block validation on a well-connected node is much
+faster than during initial sync.
+
+Otherwise it builds one {repo}/src/validation.h#L337[`CScriptCheck`] per input — a
+small closure capturing the spent output, the spending transaction, the input
+index, the verification flags, the precomputed transaction data, and a pointer to
+the signature cache:
+
+[source,cpp]
+----
+class CScriptCheck
+{
+private:
+    CTxOut m_tx_out;
+    const CTransaction *ptxTo;
+    unsigned int nIn;
+    script_verify_flags m_flags;
+    bool cacheStore;
+    PrecomputedTransactionData *txdata;
+    SignatureCache* m_signature_cache;
+public:
+    // ...
+    CScriptCheck(const CScriptCheck&) = delete;
+    CScriptCheck& operator=(const CScriptCheck&) = delete;
+    CScriptCheck(CScriptCheck&&) = default;
+    CScriptCheck& operator=(CScriptCheck&&) = default;
+
+    std::optional<std::pair<ScriptError, std::string>> operator()();
+};
+----
+
+Three things to notice. `operator()` returns an empty optional on success, or the
+script error and a debug string on failure, so a failing check carries its own
+diagnosis out of whatever thread ran it. The class is move-only, with
+`static_assert`s that moves are `noexcept`, because it lives in vectors on a hot
+path. And the signature cache is not a global; it is part of the `ValidationCache`
+owned by `ChainstateManager`.
+
+The `pvChecks` parameter decides whether verification happens now or later:
+
+[source,cpp]
+----
+CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata);
+if (pvChecks) {
+    pvChecks->emplace_back(std::move(check));
+} else if (auto result = check(); result.has_value()) {
+    // ... verification failed: fill in state as TX_NOT_STANDARD or TX_CONSENSUS
+}
+----
+
+Only `ConnectBlock` passes a non-null `pvChecks`, because only a block has enough
+inputs to be worth parallelising. It does so through
+{repo}/src/checkqueue.h#L208[`CCheckQueueControl`], an RAII handle that takes
+exclusive use of the queue for the duration of one block:
+
+[source,cpp]
+----
+std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
+std::optional<CCheckQueueControl<CScriptCheck>> control;
+if (auto& queue = m_chainman.GetCheckQueue(); queue.HasThreads() && fScriptChecks) control.emplace(queue);
+// ... for each transaction:
+if (control) {
+    std::vector<CScriptCheck> vChecks;
+    tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks);
+    if (tx_ok) control->Add(std::move(vChecks));
+}
+// ... after the loop:
+auto parallel_result = control->Complete();
+----
+
+Note the comment in the real code about `txsdata`: it is preallocated to the block's
+size so that no reallocation can invalidate the `PrecomputedTransactionData*`
+pointers the queued checks hold while worker threads are still using them.
+
+The queue is a member of `ChainstateManager`:
+
+[source,cpp]
+----
+//! A queue for script verifications that have to be performed by worker threads.
+CCheckQueue<CScriptCheck> m_script_check_queue;
+----
+
+constructed with a batch size of 128 and a thread count clamped to
+{repo}/src/validation.h#L90[`MAX_SCRIPTCHECK_THREADS{15}`], and reached via
+{repo}/src/validation.h#L1385[`GetCheckQueue()`]. Worker threads are spawned in
+`CCheckQueue`'s constructor and joined in its destructor, so their lifetime is tied
+to `ChainstateManager`'s. `HasThreads()` is the "can we parallelise" test; with
+`-par=1` there are no workers and `ConnectBlock` verifies inline.
+
+The thread count is computed in
+{repo}/src/node/chainstatemanager_args.cpp#L54[`node/chainstatemanager_args.cpp`]:
+
+[source,cpp]
+----
+int script_threads = args.GetIntArg("-par", DEFAULT_SCRIPTCHECK_THREADS);
+if (script_threads <= 0) {
+    // -par=0 means autodetect (number of cores - 1 script threads)
+    // -par=-n means "leave n cores free" (number of cores - n - 1 script threads)
+    script_threads += GetNumCores();
+}
+// Subtract 1 because the main thread counts towards the par threads.
+opts.worker_threads_num = script_threads - 1;
+----
+
+The master thread (`b-msghand`, usually) joins the pool as an extra worker inside
+`Complete()` rather than idling, which is why one is subtracted.
+
+=== Parallel prevout fetching
+
+A second axis of parallelism inside block validation. Before scripts can be checked,
+`ConnectBlock` must look up every coin the block spends. On a node whose cache is
+cold — during initial sync, or after a restart — most of those lookups miss the
+in-memory cache and turn into LevelDB reads, which are I/O-bound and parallelise
+well.
+
+{repo}/src/validation.cpp#L1850[`CoinsViews::InitCache`] creates a `ThreadPool`
+named `prevout` and hands it to a {repo}/src/coins.h#L655[`CoinsViewOverlay`]:
+
+[source,cpp]
+----
+void CoinsViews::InitCache(int32_t prevoutfetch_threads)
+{
+    AssertLockHeld(::cs_main);
+    m_cacheview = std::make_unique<CCoinsViewCache>(&m_catcherview);
+    auto thread_pool{std::make_shared<ThreadPool>("prevout")};
+    if (prevoutfetch_threads > 0) {
+        thread_pool->Start(prevoutfetch_threads);
+        LogInfo("Block input prevout fetching uses %d additional threads", prevoutfetch_threads);
+    }
+    m_connect_block_view = std::make_unique<CoinsViewOverlay>(&*m_cacheview, std::move(thread_pool));
+}
+----
+
+`ConnectTip` then wraps each `ConnectBlock` call
+({repo}/src/validation.cpp#L3042[`validation.cpp`]):
+
+[source,cpp]
+----
+CoinsViewOverlay& view{*m_coins_views->m_connect_block_view};
+const auto reset_guard{view.StartFetching(*block_to_connect)};
+bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
+// ...
+view.Flush(/*reallocate_cache=*/false);
+----
+
+The comment above `CoinsViewOverlay` in `coins.h` is one of the best-illustrated in
+the tree and worth reading in full. In short: `StartFetching` flattens every input
+of the block into a vector and submits worker tasks. Workers race to claim the next
+unclaimed index with an atomic increment (`m_input_head`), fetch that coin, and set
+a per-entry "ready" flag with release semantics. The validation thread consumes
+entries in block order (`m_input_tail`); when it needs a coin that is not already
+cached, it checks whether the next entry is the one it wants and, if so, waits on
+that entry's flag with acquire semantics. Workers read with `PeekCoin()`, which does
+not populate the intermediate caches, so a block that turns out to be invalid leaves
+the main cache untouched. The `reset_guard` guarantees the workers are stopped
+before the block they reference goes out of scope.
+
+Controlled by `-prevoutfetchthreads`, default
+{repo}/src/kernel/chainstatemanager_opts.h#L25[`8`], bounded by
+{repo}/src/validation.h#L93[`MAX_PREVOUTFETCH_THREADS{16}`], and disabled with `0`.
+Negative values are rejected at startup.
+
+=== Loading blocks — the `initload` thread
+
+One background thread, {repo}/src/node/context.h#L93[`node.background_init_thread`],
+performs everything that is part of startup but must not block the node from coming
+up: external block import (`-loadblock`), reindex, initial chain activation,
+starting index background sync, and loading the mempool from disk.
+
+[source,cpp]
+----
+node.background_init_thread = std::thread(&util::TraceThread, "initload",
+        [=, &chainman, &args, &kernel_notifications, &node] {
+    ScheduleBatchPriority();
+    // Import blocks and ActivateBestChain()
+    ImportBlocks(chainman, vImportFiles);
+    // ... wake the init thread's genesis wait in case the import was interrupted
+    WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
+    // ... -stopafterblockimport handling
+    // Start indexes initial sync
+    if (!StartIndexBackgroundSync(node)) { /* fatal */ }
+    // Load mempool from disk
+    if (auto* pool{chainman.ActiveChainstate().GetMempool()}) {
+        const bool loaded{LoadMempool(*pool, ShouldPersistMempool(args) ? MempoolPath(args) : fs::path{},
+                                      chainman.ActiveChainstate(), {})};
+        if (node.fee_estimator_man && !chainman.m_interrupt && !loaded) {
+            node.fee_estimator_man->MempoolLoadFailed();
+        }
+        pool->SetLoadTried(!chainman.m_interrupt);
+    }
+});
+----
+
+{repo}/src/node/blockstorage.cpp#L1270[`ImportBlocks`] lives in
+`node/blockstorage.cpp`. `ScheduleBatchPriority()` asks the OS to deprioritise the
+thread so that a slow reindex does not starve the rest of the node. The fee
+estimator is told when the mempool could not be loaded because its mempool-based
+estimates would otherwise be computed from an unrepresentative, nearly empty
+mempool.
+
+Meanwhile the main thread, after starting `initload`, waits for the genesis block to
+be connected before starting the network. That wait is why the thread has to
+explicitly wake it if the import is interrupted early.
+
+=== Servicing RPC calls
+
+Bitcoin Core implements its own HTTP/1.1 server on top of
+{repo}/src/util/sock.h[`Sock`], in {repo}/src/httpserver.cpp[`httpserver.cpp`].
+A few comments there mention libevent; they document HTTP behaviour the server
+deliberately reproduces, and there is no libevent dependency.
+
+{repo}/src/init.cpp#L779[`AppInitServers(...)`] calls `InitHTTPServer()` to bind
+the listening sockets and read the limits, then
+{repo}/src/httpserver.cpp#L1387[`StartHTTPServer()`]:
+
+[source,cpp]
+----
+void StartHTTPServer()
+{
+    auto rpcThreads{std::max(gArgs.GetArg<int>("-rpcthreads", DEFAULT_HTTP_THREADS), 1)};
+    LogInfo("Starting HTTP server with %d worker threads", rpcThreads);
+    g_threadpool_http.Start(rpcThreads);
+    g_http_server->StartSocketsThreads();
+}
+----
+
+The division of labour mirrors the P2P side. One I/O thread (`b-http`, running
+{repo}/src/httpserver.cpp#L1049[`HTTPServer::ThreadSocketHandler`]) accepts
+connections, reads bytes, parses requests, and writes responses. A
+{repo}/src/util/threadpool.h#L47[`ThreadPool`] of workers (`b-http.00`,
+`b-http.01`, …) executes complete requests — which means running RPC methods, which
+may take `cs_main` and block for a long time — off the I/O thread.
+
+The pieces to know:
+
+* {repo}/src/httpserver.h#L492[`HTTPRemoteClient`] is one connection: socket,
+  receive buffer, send buffer, and at most one in-progress request.
+* {repo}/src/httpserver.h#L154[`HTTPRequest`] is one parsed request. It carries an
+  explicit {repo}/src/httpserver.h#L196[`State`] (`Init`, `NeedsHeaders`,
+  `NeedsBody`, `Complete`, `Error`) because a request may arrive across many socket
+  reads, including chunked bodies. It points back at its client through a
+  `std::weak_ptr`, so a worker finishing a request for a client that has since
+  disconnected simply has nowhere to write.
+* `-rpcallowip` is checked immediately on accept, before any bytes are read.
+
+The server defends itself against slow or hostile clients with explicit limits in
+{repo}/src/httpserver.h#L47[`httpserver.h`]: at most `-rpcmaxconnections` (default
+16) simultaneous clients — beyond that it stops polling the listening socket and
+leaves new connections in the kernel's backlog — a header limit of 8 KiB, a body
+limit of {repo}/src/httpserver.h#L82[`MAX_BODY_SIZE{32_MiB}`], `-rpcservertimeout`
+for idle connections, and `-rpcworkqueue` (default 64) for requests waiting on a
+worker. It also applies backpressure: while a client's send buffer is still being
+drained, the I/O loop does not hand that client's next request to a worker, and
+pipelined bytes are left in the kernel's socket buffer rather than read into memory.
+The comment in {repo}/src/httpserver.cpp#L994[`GenerateWaitSockets`] spells out
+exactly which event is polled for in each state.
+
+{repo}/src/httpserver.h#L34[`DEFAULT_HTTP_THREADS`] is 16.
+
+Shutdown is a staged sequence worth knowing if you ever chase lifetime bugs here.
+`InterruptHTTPServer` swaps the request handler for `RejectRequest` *before*
+interrupting the pool, so nothing new is dispatched. Then
+{repo}/src/httpserver.cpp#L1407[`StopHTTPServer`] stops the pool, stops accepting,
+and waits up to 30 seconds for clients to disconnect gracefully — with an explicit
+ordering comment that `StopAccepting()` must precede `DisconnectAllClients()`,
+because a connection accepted after the count reads zero would otherwise survive
+into the destructor. Only then is the I/O thread interrupted and joined, and any
+remaining clients forcibly removed.
+
+=== Loading peer addresses from DNS seeds
+
+{repo}/src/net.h#L1774[`threadDNSAddressSeed`] runs
+{repo}/src/net.cpp#L2293[`CConnman::ThreadDNSAddressSeed()`]. It is created in
+`CConnman::Start` only if seeding is enabled:
+
+[source,cpp]
+----
+if (!gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED))
+    LogInfo("DNS seeding disabled\n");
+else
+    threadDNSAddressSeed = std::thread(&util::TraceThread, "dnsseed", [this] { ThreadDNSAddressSeed(); });
+----
+
+The thread does not blindly query on every start. If `AddrMan` already has a healthy
+number of addresses it waits, giving existing peers a chance to connect, and only
+falls through to DNS if the node still lacks outbound connections. When a
+`-proxy` is configured, the node does not resolve seeds itself; it hands each seed
+name to the proxy as an `addrfetch` connection instead.
+
+=== Sending and receiving — the socket handler
+
+{repo}/src/net.h#L1775[`threadSocketHandler`] runs the loop shown earlier:
+`DisconnectNodes()`, `NotifyNumConnectionsChanged()`, `SocketHandler()`.
+
+`DisconnectNodes()` drops everything if the network has been turned off with
+`setnetworkactive`, and otherwise reaps peers flagged `fDisconnect` and frees nodes
+whose reference count has reached zero. `NotifyNumConnectionsChanged()` pokes the
+UI. `SocketHandler()` does the actual `poll`/`select`, accepts inbound connections,
+reads bytes into each peer's transport (which deframes, and for v2 decrypts, them
+into messages), and writes queued bytes out. It deliberately does no
+application-level interpretation — deciding what a message *means* is `b-msghand`'s
+job. When a complete message arrives, the socket thread queues it on the peer and
+wakes the message handler.
+
+=== Initiating outbound connections
+
+{repo}/src/net.h#L1777[`threadOpenConnections`] runs
+{repo}/src/net.cpp#L2595[`ThreadOpenConnections(...)`] and is responsible for
+choosing peers from `AddrMan`, honouring network-group diversity via
+{repo}/src/netgroup.h[`NetGroupManager`] (which uses ASMap — an IP-to-autonomous-
+system map, embedded in the binary by default — so that no single network operator
+can supply all of your peers), and opening full-relay, block-relay-only, and feeler
+connections up to the limits above. Whether it starts at all depends on
+configuration:
+
+[source,cpp]
+----
+if (connOptions.m_use_addrman_outgoing || !connOptions.m_specified_outgoing.empty()) {
+    threadOpenConnections = std::thread(
+        &util::TraceThread, "opencon",
+        [this, connect = connOptions.m_specified_outgoing, seed_nodes = std::move(seed_nodes)] {
+            ThreadOpenConnections(connect, seed_nodes);
+        });
+}
+----
+
+`-connect=0` disables automatic outbound connections entirely, in which case the
+thread is never created; `-connect=<ip>` restricts outbound connections to exactly
+what was specified.
+
+=== Opening added connections
+
+{repo}/src/net.h#L1776[`threadOpenAddedConnections`] runs
+{repo}/src/net.cpp#L3055[`ThreadOpenAddedConnections()`], which polls
+`GetAddedNodeInfo()` for peers supplied via `-addnode` or the `addnode` RPC and
+calls `OpenNetworkConnection(...)` for any that are not currently connected. These
+are accounted separately from automatic connections, up to
+`MAX_ADDNODE_CONNECTIONS`.
+
+=== I2P
+
+{repo}/src/net.h#L1779[`threadI2PAcceptIncoming`] runs
+{repo}/src/net.cpp#L3260[`ThreadI2PAcceptIncoming()`], started only when an I2P SAM
+session was configured with `-i2psam` and inbound I2P is enabled. It accepts inbound
+I2P connections through the SAM proxy. See {repo}/doc/i2p.md[`doc/i2p.md`]; the
+Tor and CJDNS equivalents are documented in {repo}/doc/tor.md[`doc/tor.md`] and
+{repo}/doc/cjdns.md[`doc/cjdns.md`].
+
+[[private-broadcast]]
+=== Private broadcast
+
+{repo}/src/net.h#L1780[`threadPrivateBroadcast`] runs
+{repo}/src/net.cpp#L3305[`ThreadPrivateBroadcast()`], gated on
+`-privatebroadcast` (off by default, and explicitly marked experimental). The
+problem it addresses: when you announce your own transaction to your regular peers,
+an observer connected to many nodes can often tell that it originated with you. With
+private broadcast, the node instead opens short-lived, dedicated connections —
+over Tor or I2P in the intended deployment — hands the transaction to peers that
+know nothing else about it, and disconnects.
+
+{repo}/src/private_broadcast.h#L29[`PrivateBroadcast`] tracks which transactions
+still need sending, which peer each was handed to, and whether it has been seen
+coming back from the network. Its constants document the policy:
+`INITIAL_STALE_DURATION` (5 minutes) before a never-delivered transaction is
+retried, `STALE_DURATION` (1 minute) after sending without hearing it echo back,
+`MAX_TRANSACTIONS` (10,000) tracked at once, and
+{repo}/src/private_broadcast.h#L48[`MAX_SEND_ATTEMPTS`] (1,000) per transaction.
+A private broadcast peer that misbehaves is disconnected but not added to the
+discouragement filter.
+
+=== Processing messages — `net` → `net_processing`
+
+{repo}/src/net.h#L1778[`threadMessageHandler`] runs
+{repo}/src/net.cpp#L3219[`CConnman::ThreadMessageHandler()`]. This is the thread you
+will spend most of your debugging life on:
+
+[source,cpp]
+----
+void CConnman::ThreadMessageHandler()
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+
+    while (!flagInterruptMsgProc)
+    {
+        bool fMoreWork = false;
+        {
+            // Randomize the order in which we process messages from/to our peers.
+            const NodesSnapshot snap{*this, /*shuffle=*/true};
+
+            for (CNode* pnode : snap.Nodes()) {
+                if (pnode->fDisconnect) continue;
+                bool fMoreNodeWork{m_msgproc->ProcessMessages(*pnode, flagInterruptMsgProc)};
+                fMoreWork |= (fMoreNodeWork && !pnode->fPauseSend);
+                if (flagInterruptMsgProc) return;
+                m_msgproc->SendMessages(*pnode);
+                if (flagInterruptMsgProc) return;
+            }
+        }
+        WAIT_LOCK(mutexMsgProc, lock);
+        if (!fMoreWork) {
+            condMsgProc.wait_until(lock, std::chrono::steady_clock::now() + std::chrono::milliseconds(100),
+                                   [this]() EXCLUSIVE_LOCKS_REQUIRED(mutexMsgProc) { return fMsgProcWake; });
+        }
+        // ...
+    }
+}
+----
+
+Each pass visits every peer once, processing *at most one* incoming message per
+peer (`ProcessMessages`) and then letting `SendMessages` queue anything owed to that
+peer — pings, inventory announcements, header announcements, `getdata` requests,
+fee filter updates. Handling one message per peer per pass is a fairness mechanism:
+a peer that floods you cannot starve the others. If any peer still has queued work,
+the loop goes round again immediately; otherwise it sleeps until woken by the
+socket thread or 100 ms pass.
+
+Two further details are worth internalising. The peer iteration order is shuffled on
+every pass, so an attacker holding several consecutive slots cannot rely on being
+serviced in a fixed order. And the whole loop holds `g_msgproc_mutex`, which is the
+formal statement that message processing is single-threaded — a lot of
+`net_processing` state carries `EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)`
+annotations that are satisfied only because of this.
+
+`m_msgproc` is the {repo}/src/net_processing.h#L90[`PeerManager`], an abstract
+interface implemented by `PeerManagerImpl` in
+{repo}/src/net_processing.cpp[`net_processing.cpp`]. Transaction download
+scheduling — which peer to request each announced transaction from, timeouts,
+orphan handling, and deciding when to try a package — is delegated to
+{repo}/src/node/txdownloadman.h[`node::TxDownloadManager`], with
+{repo}/src/node/txorphanage.h[`txorphanage`] and {repo}/src/txrequest.h[`txrequest`]
+beneath it.
+
+=== The scheduler
+
+{repo}/src/scheduler.h#L38[`CScheduler`] is a single-threaded task queue with
+support for scheduling work at a time, after a delay, or on a repeating interval.
+Its loop is {repo}/src/scheduler.cpp#L23[`CScheduler::serviceQueue()`], started
+early in `AppInitMain`:
+
+[source,cpp]
+----
+scheduler.m_service_thread = std::thread(util::TraceThread, "scheduler", [&] { scheduler.serviceQueue(); });
+----
+
+It runs periodic maintenance — `DumpAddresses()` every 15 minutes, the ASMap health
+check every 24 hours, wallet flushing, fee estimate flushing every hour, stale-tip
+checks and extra outbound peer management for `net_processing` — and, importantly,
+it is the execution context for asynchronous validation callbacks, described next.
+
+== Notification mechanisms
+
+There are two distinct notification systems in the tree, and confusing them is a
+common early mistake.
+
+=== `ValidationSignals` and `CValidationInterface`
+
+Many components need to react to validation events: the wallet when a relevant
+transaction confirms, `net_processing` when the tip advances, indexes when a block
+connects, the fee estimator when a block removes transactions from the mempool, ZMQ
+subscribers on essentially everything. Rather than having validation call each of
+them directly, Bitcoin Core uses a publish/subscribe arrangement with an
+asynchronous queue in the middle, so that a slow subscriber cannot hold up
+validation.
+
+{repo}/src/validationinterface.h#L50[`CValidationInterface`] is the subscriber
+interface. Every method is `virtual` with an empty default body, so a subscriber
+implements only the events it cares about:
+
+[source,cpp]
+----
+class CValidationInterface {
+protected:
+    virtual void UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload) {}
+    virtual void ActiveTipChange(const CBlockIndex& new_tip, bool is_ibd) {};
+    virtual void TransactionAddedToMempool(const NewMempoolTransactionInfo& tx, uint64_t mempool_sequence) {}
+    virtual void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason, uint64_t mempool_sequence) {}
+    virtual void MempoolTransactionsRemovedForBlock(const std::shared_ptr<const CBlock>& block,
+                                                    const std::vector<RemovedMempoolTransactionInfo>& txs_removed_for_block,
+                                                    unsigned int block_height) {}
+    virtual void BlockConnected(const kernel::ChainstateRole& role, const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex) {}
+    virtual void BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex) {}
+    virtual void ChainStateFlushed(const kernel::ChainstateRole& role, const CBlockLocator& locator) {}
+    virtual void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) {}
+    virtual void NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock>& block) {};
+    friend class ValidationSignals;
+};
+----
+
+The header's own comments say which methods are delivered "on a background
+thread", i.e. through the queue. Most are. The exceptions matter:
+`ActiveTipChange`, `BlockChecked`, and `NewPoWValidBlock` are called directly on
+the validation thread, because their consumers (e.g. compact block relay in
+`net_processing`, or a miner waiting on `submitblock`) need the result before
+validation moves on.
+
+A few of the argument types tell you something about the architecture.
+`TransactionAddedToMempool` receives a `NewMempoolTransactionInfo` rather than a
+bare transaction, so subscribers get fee and size information without re-querying
+the mempool under its lock. `MempoolTransactionsRemovedForBlock` delivers the block
+and exactly which mempool entries it confirmed, which is the raw data fee estimation
+learns from. And `BlockConnected` and `ChainStateFlushed` take a
+`kernel::ChainstateRole`, because with assumeutxo there can be two chainstates and a
+subscriber usually cares about only one of them (see <<chainstates>>).
+
+The publisher side is
+{repo}/src/validationinterface.h#L169[`ValidationSignals`], an object owned by
+{repo}/src/node/context.h#L57[`NodeContext`] and constructed in
+{repo}/src/init.cpp#L1554[`AppInitMain`] with an explicit task runner:
+
+[source,cpp]
+----
+node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<SerialTaskRunner>(scheduler));
+----
+
+{repo}/src/scheduler.h#L124[`SerialTaskRunner`] dispatches callbacks on the
+scheduler thread, one at a time and in order, so subscribers see events in the
+sequence they happened and never on the validation thread.
+{repo}/src/util/task_runner.h[`ImmediateTaskRunner`] is the synchronous alternative,
+used by the kernel library and in tests where a scheduler would be overkill.
+Passing the runner in, rather than baking a scheduler dependency into the signal
+machinery, is what makes `libbitcoin_kernel` usable without a node.
+
+Registration is a method call: `RegisterValidationInterface` for raw pointers whose
+lifetime the caller manages, and `RegisterSharedValidationInterface` for
+`shared_ptr` subscribers, which are kept alive until the last notification already
+queued for them has been delivered. If you need validation to have "caught up" with
+all queued notifications — tests do this constantly —
+`SyncWithValidationInterfaceQueue()` blocks until the queue drains.
+
+Current subscribers:
+
+* {repo}/src/net_processing.h#L90[`PeerManager`]
+* {repo}/src/index/base.h#L54[`BaseIndex`] (txindex, block filter index, coinstats index, txospender index)
+* {repo}/src/policy/fees/estimator_man.h#L27[`FeeRateEstimatorManager`]
+* {repo}/src/zmq/zmqnotificationinterface.h#L21[`CZMQNotificationInterface`]
+* {repo}/src/node/interfaces.cpp#L462[`NotificationsProxy`] (the bridge to `interfaces::Chain` consumers, i.e. the wallet and GUI)
+* {repo}/src/node/block_template_manager.cpp#L52[`SubmitBlockStateCatcher`] and {repo}/src/rpc/mining.cpp#L1069[`submitblock_StateCatcher`] — short-lived subscribers that capture the `BlockChecked` result for a block just submitted by a miner
+* {repo}/src/kernel/bitcoinkernel.cpp#L337[`KernelValidationInterface`] (forwards events to C API users)
+
+=== `kernel::Notifications`
+
+The second mechanism.
+{repo}/src/kernel/notifications_interface.h#L35[`kernel::Notifications`] is a
+*synchronous* interface for things the validation engine must tell its host
+immediately, and which cannot go through a queue:
+
+[source,cpp]
+----
+class Notifications
+{
+public:
+    virtual ~Notifications() = default;
+
+    [[nodiscard]] virtual InterruptResult blockTip(SynchronizationState state, const CBlockIndex& index, double verification_progress) { return {}; }
+    virtual void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) {}
+    virtual void progress(const bilingual_str& title, int progress_percent, bool resume_possible) {}
+    virtual void warningSet(Warning id, const bilingual_str& message) {}
+    virtual void warningUnset(Warning id) {}
+    virtual void flushError(const bilingual_str& message) {}
+    virtual void fatalError(const bilingual_str& message) {}
+};
+----
+
+The node's implementation is
+{repo}/src/node/kernel_notifications.h#L43[`node::KernelNotifications`]. Note that
+`blockTip` returns an `InterruptResult` — this is how validation learns, at a safe
+point, that it should stop (for example `-stopatheight`). The node's implementation
+also keeps the current tip behind a mutex and condition variable
+(`m_tip_block_mutex`, `m_tip_block_cv`); that is what `waitfornewblock`, the mining
+interface's `waitTipChanged`, and the init thread's genesis wait block on. Progress
+reporting, warnings, and fatal errors also travel here rather than through
+`ValidationSignals`, precisely because they must not be deferred.
+
+The division of labour: `ValidationSignals` is for consumers that react to chain
+events asynchronously; `kernel::Notifications` is for the embedder that needs to
+know *now*.
+
+[[chainstates]]
+== Chainstates and assumeutxo
+
+A {repo}/src/validation.h#L549[`Chainstate`] is one view of the chain: a `CChain`
+of block index entries from genesis to a tip, plus the UTXO set that results from
+applying those blocks (`m_coins_views`), plus — for the chainstate you are actually
+using — a pointer to the mempool. `ActivateBestChain`, `ConnectTip`,
+`DisconnectTip`, and `ConnectBlock` are `Chainstate` members.
+
+{repo}/src/validation.h#L949[`ChainstateManager`] sits above it and owns what is
+shared: the block index (`BlockManager`), the script check queue, the validation
+caches, header processing (`ProcessNewBlockHeaders`), block processing
+(`ProcessNewBlock`), and a vector of chainstates,
+{repo}/src/validation.h#L1396[`m_chainstates`]. Most of the time that vector holds
+one element. It holds two while an assumeutxo snapshot is being validated.
+
+Assumeutxo works like this. Given a serialised UTXO set snapshot (produced by
+`dumptxoutset`, and accepted only if its hash matches one hardcoded in chain
+params), {repo}/src/validation.h#L1118[`ActivateSnapshot(...)`] creates a second
+chainstate whose UTXO set is loaded directly from the snapshot and whose tip is
+fast-forwarded to the snapshot's base block. The node can sync from there to the
+network tip and become usable in minutes. Meanwhile the original chainstate keeps
+validating from genesis — but now with a *target*:
+{repo}/src/validation.h#L573[`m_target_blockhash`] is set to the snapshot's base
+block, and it stops there. When it arrives,
+{repo}/src/validation.h#L1129[`MaybeValidateSnapshot`] compares the UTXO set it
+computed with the snapshot's; if they match, the snapshot chainstate is marked
+validated and the historical one is discarded. A mismatch is a fatal error.
+
+The vocabulary in the code:
+
+* {repo}/src/validation.h#L526[`Assumeutxo`] — per-chainstate state: `VALIDATED`
+  (every block was checked), `UNVALIDATED` (based on a snapshot not yet confirmed),
+  or `INVALID`.
+* {repo}/src/validation.h#L1132[`CurrentChainstate()`] — the chainstate with no
+  target block, i.e. the one following the network tip and the one wallets, RPC,
+  and the mempool use. `ActiveChainstate()` and `ActiveChain()` are older
+  convenience wrappers for the same thing.
+* {repo}/src/validation.h#L1141[`HistoricalChainstate()`] — the background one, if
+  any, targeting the snapshot block.
+* `ValidatedChainstate()` — whichever of the two is fully validated; used by indexes
+  that must process blocks strictly in order from genesis.
+
+The consequence for reading code is the
+{repo}/src/kernel/types.h#L18[`kernel::ChainstateRole`] argument that appears
+throughout the notification interfaces. It is a small struct:
+
+[source,cpp]
+----
+struct ChainstateRole {
+    //! Whether this is a notification from a chainstate that's been fully
+    //! validated starting from the genesis block. False if it is from an
+    //! assumeutxo snapshot chainstate that has not been validated yet.
+    bool validated{true};
+
+    //! Whether this is a historical chainstate downloading old blocks to
+    //! validate an assumeutxo snapshot, not syncing to the network tip.
+    bool historical{false};
+};
+----
+
+Subscribers use it to tell "a block connected in the chainstate the user is looking
+at" from "a block connected during background validation". The wallet and ZMQ care
+about the former; indexes care about validated blocks in order; statistics code may
+care about both.
+
+See {repo}/doc/design/assumeutxo.md[`doc/design/assumeutxo.md`] for the mechanism
+and {repo}/doc/assumeutxo.md[`doc/assumeutxo.md`] for operator-facing usage.
+
+== The mempool and `TxGraph`
+
+{repo}/src/txmempool.h[`CTxMemPool`] holds unconfirmed transactions in a
+`boost::multi_index` container indexed by txid, wtxid, and entry time. The
+*relationships* between those transactions — which spends which, and therefore
+which must be mined together — are held separately in
+{repo}/src/txgraph.h[`TxGraph`]:
+
+[source,cpp]
+----
+mutable RecursiveMutex cs ACQUIRED_AFTER(::cs_main);
+std::unique_ptr<TxGraph> m_txgraph GUARDED_BY(cs);
+mutable std::unique_ptr<TxGraph::BlockBuilder> m_builder GUARDED_BY(cs);
+indexed_transaction_set mapTx GUARDED_BY(cs);
+----
+
+`TxGraph` is deliberately Bitcoin-agnostic: it knows about nodes, dependencies,
+fees, and sizes, and it answers questions about *clusters* — the connected
+components of the dependency graph — and their optimal *linearisations*, meaning
+the order in which a cluster's transactions should be mined to maximise fees at
+every prefix. Each `CTxMemPoolEntry` derives from `TxGraph::Ref`, so an entry *is*
+its own handle into the graph. The Bitcoin-specific policy lives in `CTxMemPool` on
+top. Many `CTxMemPool` methods are thin wrappers; `GetDescendantCount`, for
+instance, is `m_txgraph->GetDescendants(...).size()`.
+
+Note also the lock order written into the declaration: `cs` is acquired after
+`cs_main`. Code that needs both takes `cs_main` first.
+
+The mempool's admission limits are therefore *cluster* limits, defined in
+{repo}/src/policy/policy.h#L72[`src/policy/policy.h`] and carried in
+{repo}/src/kernel/mempool_limits.h#L20[`kernel/mempool_limits.h`]:
+
+[source,cpp]
+----
+inline constexpr unsigned int DEFAULT_CLUSTER_LIMIT{64};
+inline constexpr unsigned int DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101};
+----
+
+`-limitclustercount` and `-limitclustersize` bound them. `-limitancestorcount` and
+`-limitdescendantcount` still exist but are documented in
+{repo}/src/init.cpp#L675[`init.cpp`] as deprecated and used only by the wallet for
+coin selection — the mempool itself does not enforce them.
+
+The practical significance is that mining, eviction, and replacement can all reason
+about groups of related transactions exactly rather than heuristically.
+`BlockAssembler` asks the mempool to start a `TxGraph::BlockBuilder`, which yields
+chunks in feerate order for block template construction. Replacement (RBF)
+decisions compare the *feerate diagrams* of the mempool before and after a proposed
+change. Because optimal linearisation can be expensive for large clusters,
+{repo}/src/txmempool.h#L52[`txmempool.h`] sets explicit work budgets:
+`ACCEPTABLE_COST` (75,000) is the effort after which a cluster's linearisation is
+considered good enough, and `POST_CHANGE_COST` (five times that) caps how much
+improvement work is done after each mempool change. The rest of the tree calls this
+design "cluster mempool"; {repo}/doc/policy/mempool-design.md[`doc/policy/mempool-design.md`]
+explains it from first principles.
+
+== Fee estimation
+
+Fee estimation is owned by
+{repo}/src/policy/fees/estimator_man.h#L27[`FeeRateEstimatorManager`], held as
+{repo}/src/node/context.h#L71[`NodeContext::fee_estimator_man`]. It is the
+`CValidationInterface` subscriber, and it combines two estimators:
+
+* `CBlockPolicyEstimator` — the historical approach. It watches transactions enter
+  the mempool and records how many blocks each feerate bucket took to confirm,
+  building statistics over short, medium, and long horizons. It answers any target
+  up to about 1,000 blocks, and persists to `fee_estimates.dat`.
+* {repo}/src/policy/fees/mempool_estimator.h#L87[`MemPoolFeeRateEstimator`] — a
+  forward-looking estimate for the next block or two. It builds a block template
+  from the current mempool with the same algorithm the miner uses, and takes the
+  50th and 75th percentile chunk feerates as its conservative and economical
+  estimates. It only answers if recently mined blocks show that this node's mempool
+  was representative of what miners actually included; otherwise it declines.
+
+`GetFeeRateEstimate` returns the lower of the two when both are available, and the
+block-policy estimate alone otherwise. The wallet reaches this through
+`interfaces::Chain::getFeeRateEstimate`, RPC through `estimatesmartfee`.
+
+== Mining
+
+{repo}/src/node/block_template_manager.h#L32[`node::BlockTemplateManager`], held as
+{repo}/src/node/context.h#L87[`NodeContext::block_template_manager`], is the single
+place that creates block templates, submits solved blocks, and waits for tip
+changes on behalf of mining code. It holds the block-creation options derived from
+the command line (`-blockmaxweight`, `-blockmintxfee`, and friends), so every caller
+gets the same defaults. Beneath it,
+{repo}/src/node/miner.h#L50[`BlockAssembler`] does the actual assembly from the
+mempool.
+
+{repo}/src/interfaces/mining.h#L107[`interfaces::Mining`] exposes this to clients:
+`getTip`, `waitTipChanged`, `createNewBlock`, `checkBlock`, and a `BlockTemplate`
+object with `waitNext` for receiving an updated template when fees or the tip
+change. Instances are made on demand by
+{repo}/src/node/interfaces.cpp#L1073[`MakeMining`]. The RPC layer
+(`getblocktemplate`, `generatetoaddress`) and IPC clients both sit on top of it.
+
+`BlockAssembler` also enforces timestamp rules in
+{repo}/src/node/miner.cpp#L50[`GetMinimumTime`] on every network, whether or not
+they are consensus there yet: the BIP94 limit on how far the first block of a
+difficulty period may go back in time, and the BIP54 rule that the last block of a
+period may not be earlier than its first. Producing templates that already satisfy
+proposed soft-fork rules makes a future activation safer.
+
+== References
+
+In-tree documentation, which is the most reliable starting point and versioned
+alongside the code:
+
+* {repo}/doc/developer-notes.md[`doc/developer-notes.md`] — coding conventions, the thread list, locking and logging guidance
+* {repo}/doc/design/libraries.md[`doc/design/libraries.md`] — library boundaries and dependency graph
+* {repo}/doc/design/multiprocess.md[`doc/design/multiprocess.md`] and {repo}/doc/multiprocess.md[`doc/multiprocess.md`] — IPC design and current usage
+* {repo}/doc/design/assumeutxo.md[`doc/design/assumeutxo.md`] — snapshot chainstates
+* {tree}/doc/policy[`doc/policy/`] — mempool design, terminology, replacement, and package rules
+* {repo}/src/node/README.md[`src/node/README.md`] and {repo}/src/interfaces/README.md[`src/interfaces/README.md`]
+* {repo}/doc/JSON-RPC-interface.md[`doc/JSON-RPC-interface.md`], {repo}/doc/REST-interface.md[`doc/REST-interface.md`]
+* {repo}/doc/i2p.md[`doc/i2p.md`], {repo}/doc/cjdns.md[`doc/cjdns.md`], {repo}/doc/tor.md[`doc/tor.md`]
+* {repo}/doc/files.md[`doc/files.md`] — on-disk layout of the data directory
+* {repo}/doc/fuzzing.md[`doc/fuzzing.md`], {repo}/doc/benchmarking.md[`doc/benchmarking.md`]
+
+External:
+
+* https://bitcoincore.academy[Onboarding to Bitcoin Core] — Chaincode's current curriculum
+* https://bitcoincore.reviews[Bitcoin Core PR Review Club] — per-PR walkthroughs, the best way to follow architectural change as it lands
+* https://doxygen.bitcoincore.org[doxygen.bitcoincore.org] — generated class and call graphs; the thread anchors in `developer-notes.md` point here
+* https://btctranscripts.com/greg-maxwell/2017-08-28-gmaxwell-deep-dive-bitcoin-core-v0.15/[A deep dive into Bitcoin Core v0.15] — dated, but still the best explanation of the caching layers
+* https://github.com/bitcoin-core/bitcoin-devwiki/wiki[Bitcoin Core dev wiki] — project pages for in-flight work
+
+[NOTE]
+====
+Verification note: code excerpts, line anchors, constants, and thread names above
+were read from the tree at `4b612c6bf8cfa319a9df130d4b3d0523fddb6579`. Excerpts are
+abridged — `// ...` marks elisions — and are reproduced under Bitcoin Core's MIT
+licence for the purpose of technical explanation. Where in-tree documentation and
+code disagree (the thread list in `developer-notes.md`), the code is treated as
+authoritative and the gap noted inline.
+====

@@ -1,0 +1,1210 @@
+= 1.1 Bitcoin Core Regions
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 2
+:icons: font
+:source-highlighter: highlight.js
+:repo: https://github.com/bitcoin/bitcoin/blob/4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+:tree: https://github.com/bitcoin/bitcoin/tree/4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+:pr: https://github.com/bitcoin/bitcoin/pull
+
+[NOTE]
+====
+Companion to `1.0_bitcoin_core_architecture.asciidoc`, and an independently written
+successor to Chaincode Labs'
+https://github.com/chaincodelabs/bitcoin-core-onboarding/blob/main/1.1_regions.asciidoc[`1.1_regions.asciidoc`],
+whose repository was archived in December 2023.
+
+Where 1.0 covers processes, threads, and control flow, this document covers the
+*static* decomposition: which directory owns which responsibility, which classes
+matter in each, and how neighbouring regions talk to each other.
+====
+
+== About this document
+
+All references are pinned to {repo}[`4b612c6bf8cfa319a9df130d4b3d0523fddb6579`]
+(30 September 2026), `master` at version `32.99.0` — v33 development, with the v32
+branch at `v32.0rc2` and v31.1 the most recent final release.
+
+[source,bash]
+----
+git clone https://github.com/bitcoin/bitcoin.git
+cd bitcoin
+git checkout -b regions_text 4b612c6bf8cfa319a9df130d4b3d0523fddb6579
+----
+
+A note on the word "region". It is a reading aid, not a project convention. The
+tree's own vocabulary is *libraries* — see
+{repo}/doc/design/libraries.md[`doc/design/libraries.md`] — and library boundaries
+are enforced by the build, whereas regions are just clusters of related files. The
+two mostly coincide, but not always: `validation.cpp` is compiled into
+`libbitcoin_kernel`, while much of what calls it lives in `libbitcoin_node`, and
+`src/node/` contains files belonging to both. Where a distinction matters it is
+flagged below.
+
+A practical tip before you start: most regions have a header whose top-of-file
+comment explains the design better than any external document. When you open a new
+area, read the header first, then the tests under
+{tree}/src/test[`src/test/`] (unit) and {tree}/test/functional[`test/functional/`]
+(end-to-end, in Python), which show how the code is meant to be driven.
+
+== The region map
+
+[cols="3,2,4",options="header"]
+|===
+| Files | Layer | Responsibility
+
+| <<net,`net.{h,cpp}`>>
+| Network
+| Sockets, connection management, message framing and encryption
+
+| <<net_processing,`net_processing.{h,cpp}`>>
+| Network processing
+| Interprets P2P messages and drives validation on their behalf
+
+| <<validation,`validation.{h,cpp}`>>
+| Validation
+| Chainstates, block and transaction acceptance, flushing
+
+| <<blockstorage,`node/blockstorage.{h,cpp}`>>
+| Block storage
+| `blk*.dat`/`rev*.dat` files and the block index database
+
+| <<txmempool,`txmempool.{h,cpp}`, `txgraph.{h,cpp}`>>
+| Mempool
+| Unconfirmed transactions and the relationships between them
+
+| <<coins,`coins.{h,cpp}`, `txdb.{h,cpp}`>>
+| Coins
+| The UTXO cache hierarchy and the chainstate database
+
+| <<dbwrapper,`dbwrapper.{h,cpp}`, `index/`>>
+| Database and indexes
+| LevelDB wrapper; optional txindex, filter, coinstats, txospender indexes
+
+| <<script,`script/`, `addresstype.{h,cpp}`>>
+| Script
+| Opcodes, interpreter, solver, signing, descriptors, miniscript
+
+| <<consensus,`consensus/`>>
+| Consensus
+| Rules that must never change without a fork
+
+| <<policy,`policy/`>>
+| Policy
+| Local relay and mempool rules; fee estimation
+
+| <<kernel,`kernel/`>>
+| Kernel
+| The validation engine as a reusable library
+
+| <<node,`node/`>>
+| Node
+| Node-level glue that is not consensus: mining, warnings, tx download, persistence
+
+| <<interfaces,`interfaces/`, `ipc/`>>
+| Interface / IPC
+| Abstract boundaries between node, wallet, GUI, and external clients — in-process or across a socket
+
+| <<rpc,`rpc/`>>
+| RPC server
+| Dispatch table, request handling, JSON conversion
+
+| <<qt,`qt/`>>
+| GUI
+| Qt interface
+
+| <<wallet,`wallet/`>>
+| Wallet
+| Keys, descriptors, coin selection, spending, rescans
+
+| <<mining,`node/block_template_manager`, `node/miner`, `interfaces/mining.h`>>
+| Mining
+| Block template assembly and submission
+
+| <<common,`common/`, `util/`>>
+| Common and util
+| Shared helpers below everything else
+|===
+
+The rough dependency direction is bottom-up: `util` → `crypto`/`consensus` →
+`kernel` → `node` → `net_processing`/`rpc`/`wallet` → `qt`. Arrows that point the
+other way are usually mediated by `interfaces/` or by a notification mechanism.
+
+[[net]]
+== `net.{h,cpp}`
+
+The bottom of the stack. It knows about sockets, bytes, and peers; it knows nothing
+about what a block or a transaction means. The central class is `CConnman`
+("connection manager"), which owns every peer connection (`CNode`) and the network
+threads.
+
+=== Wiring
+
+The network comes up when {repo}/src/init.cpp#L1490[`AppInitMain(...)`] calls
+`node.connman->Start(*node.scheduler, connOptions)`. Two things get passed in.
+
+`connOptions` is a {repo}/src/net.h#L1088[`CConnman::Options`], holding every
+user-configurable network parameter, with defaults from `net.h`.
+
+The `node` is a {repo}/src/node/context.h#L57[`NodeContext`] — the struct through
+which init, RPC, and tests pass references to the node's components without using
+globals. It is the best single-screen inventory of what a running node consists of:
+
+[source,cpp]
+----
+struct NodeContext {
+    std::unique_ptr<kernel::Context> kernel;
+    std::unique_ptr<ECC_Context> ecc_context;
+    interfaces::Init* init{nullptr};
+    std::function<bool()> shutdown_request;
+    util::SignalInterrupt* shutdown_signal{nullptr};
+    std::unique_ptr<AddrMan> addrman;
+    std::unique_ptr<CConnman> connman;
+    std::unique_ptr<CTxMemPool> mempool;
+    std::unique_ptr<const NetGroupManager> netgroupman;
+    std::unique_ptr<FeeRateEstimatorManager> fee_estimator_man;
+    std::unique_ptr<PeerManager> peerman;
+    std::unique_ptr<TorController> tor_controller;
+    std::unique_ptr<ChainstateManager> chainman;
+    std::unique_ptr<BanMan> banman;
+    ArgsManager* args{nullptr};
+    std::vector<BaseIndex*> indexes;
+    std::unique_ptr<interfaces::Chain> chain;
+    std::vector<std::unique_ptr<interfaces::ChainClient>> chain_clients;
+    interfaces::WalletLoader* wallet_loader{nullptr};
+    std::unique_ptr<CScheduler> scheduler;
+    std::function<void()> rpc_interruption_point = [] {};
+    std::unique_ptr<KernelNotifications> notifications;
+    std::unique_ptr<BlockTemplateManager> block_template_manager;
+    std::unique_ptr<ValidationSignals> validation_signals;
+    std::atomic<int> exit_status{EXIT_SUCCESS};
+    std::unique_ptr<node::Warnings> warnings;
+    std::thread background_init_thread;
+    // ...
+};
+----
+
+The header's own comment is worth taking seriously: the struct is meant to be a
+collection of references with no member functions, so that including it does not
+drag in half the tree. Members are `unique_ptr`s to forward-declared types for the
+same reason. The order of members also matters, because destruction runs in reverse
+declaration order; the comment on `block_template_manager` ("must be destroyed
+before its dependencies") is an example of that constraint being load-bearing.
+
+=== Address storage
+
+`CConnman::Start` loads addresses from `peers.dat` into
+{repo}/src/addrman.h[`AddrMan`], recreating the file if it is unreadable. Separately
+it reads `anchors.dat`:
+
+[source,cpp]
+----
+m_anchors = ReadAnchors(gArgs.GetDataDirNet() / ANCHORS_DATABASE_FILENAME);
+if (m_anchors.size() > MAX_BLOCK_RELAY_ONLY_ANCHORS) {
+    m_anchors.resize(MAX_BLOCK_RELAY_ONLY_ANCHORS);
+}
+----
+
+The two files serve different threat models. `peers.dat` is the general address
+database, organised into "new" (heard about) and "tried" (successfully connected)
+tables, bucketed by network group so that one operator cannot flood it.
+`anchors.dat` records up to
+{repo}/src/net.cpp#L58[`MAX_BLOCK_RELAY_ONLY_ANCHORS`] (2) block-relay-only peers
+from the last clean shutdown, reconnected on startup so that an adversary cannot
+cheaply replace your entire peer set across a restart — an eclipse-attack
+mitigation. `AddrMan` is persisted every
+{repo}/src/net.cpp#L64[`DUMP_PEERS_INTERVAL`] (15 minutes) via a scheduler task.
+
+=== Transports
+
+Message framing sits behind an abstraction.
+{repo}/src/net.h#L263[`Transport`] is the interface: bytes in, messages out, and
+vice versa. {repo}/src/net.h#L376[`V1Transport`] is the classic plaintext framing
+with the 4-byte network magic, 12-byte message type, length, and checksum.
+{repo}/src/net.h#L458[`V2Transport`] implements BIP324's encrypted transport, with
+the key exchange and cipher logic in {repo}/src/bip324.cpp[`src/bip324.cpp`]. An
+outbound connection to a peer advertising `NODE_P2P_V2` tries v2 first and
+reconnects with v1 if the handshake fails; an inbound v2 transport detects a v1
+peer from its first bytes and switches over. Everything above `net.cpp` sees
+deserialised `CNetMessage`s either way.
+
+The threads owned by this region (`net`, `dnsseed`, `addcon`, `opencon`, `msghand`,
+`i2paccept`, `privbcast`) are covered in the architecture document.
+
+[[net_processing]]
+== `net_processing.{h,cpp}`
+
+The adapter between the network and validation. This is where the P2P *protocol*
+lives: what each message means, what state is kept per peer, and when to ask
+validation to do something.
+
+{repo}/src/net_processing.h#L90[`PeerManager`] is the abstract interface, and it
+inherits two others:
+
+* {repo}/src/validationinterface.h#L50[`CValidationInterface`] — so it hears about
+  new blocks and tip changes (for example, to announce a new block to peers).
+* {repo}/src/net.h#L1040[`NetEventsInterface`] — peer lifecycle (`InitializeNode`,
+  `FinalizeNode`) and the `ProcessMessages`/`SendMessages` entry points called from
+  `ThreadMessageHandler`.
+
+{repo}/src/net_processing.cpp#L569[`PeerManagerImpl`] implements all of it. Only
+`PeerManager` is visible outside the file, so the implementation's large state is
+private to `net_processing.cpp`.
+
+`NetEventsInterface` also owns {repo}/src/net.h#L1044[`g_msgproc_mutex`], the static
+mutex held for the whole duration of the message-handling loop. Much of this
+region's state is annotated `EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)` and is
+therefore safe only because message processing is single-threaded.
+
+Two per-peer structures coexist, and it is worth knowing why. `CNode` (in `net.h`)
+holds connection-level state owned by `CConnman`. `Peer` (inside
+`net_processing.cpp`) holds protocol-level state — sync progress, announced
+inventory, misbehaviour flag, address relay state — owned by `PeerManagerImpl` and
+looked up by `NodeId`. Keeping them apart is what stops the network layer from
+depending on protocol details.
+
+`ProcessMessages` (plural) is the per-peer pump. In order, it: answers any pending
+`getdata` requests, reconsiders one orphan transaction if any has become
+processable, and — only if neither produced work and the send buffer is not full —
+takes one message off the peer's queue and hands it to `ProcessMessage` (singular),
+the large dispatch on `msg_type` that decodes each message and calls into
+validation. `SendMessages` is the other half: it runs every pass for every peer and
+decides what to send them.
+
+=== Transaction download
+
+The logic deciding which transactions to request, from whom, and what to do with
+the result lives in
+{repo}/src/node/txdownloadman.h[`node::TxDownloadManager`], held as
+{repo}/src/net_processing.cpp#L870[`m_txdownloadman`]:
+
+[source,cpp]
+----
+node::TxDownloadManager m_txdownloadman GUARDED_BY(m_tx_download_mutex);
+----
+
+It sits on top of {repo}/src/node/txorphanage.h[`txorphanage`] (transactions whose
+parents are missing) and {repo}/src/txrequest.h[`txrequest`] (which peer to ask for
+what, with preference for outbound peers and timeouts so that a slow peer cannot
+stall a transaction indefinitely). It decides whether a rejected transaction should
+be retried, remembered as invalid, or combined with a parent into a package for
+`ProcessNewPackage`. If you are tracing why a transaction was or was not requested,
+this is the region to read, not `ProcessMessage`.
+
+=== Misbehaviour
+
+When a peer sends something that no honest peer would, `net_processing` calls
+{repo}/src/net_processing.cpp#L2018[`Misbehaving`]. There is no graduated score:
+any call means the peer will be discouraged.
+
+[source,cpp]
+----
+void PeerManagerImpl::Misbehaving(Peer& peer, const std::string& message)
+{
+    LOCK(peer.m_misbehavior_mutex);
+
+    const std::string message_prefixed = message.empty() ? "" : (": " + message);
+    peer.m_should_discourage = true;
+    LogDebug(BCLog::NET, "Misbehaving: peer=%d%s\n", peer.m_id, message_prefixed);
+    TRACEPOINT(net, misbehaving_connection, peer.m_id, message.c_str());
+}
+----
+
+The flag is acted on later, in `SendMessages`: the peer is disconnected and its
+address is recorded in {repo}/src/banman.h[`BanMan`]'s discouragement filter, so
+future inbound connections from it are the first to be evicted. The handling
+function, `MaybeDiscourageAndDisconnect`, has explicit exceptions: peers with
+`noban` permission and manual (`-addnode`/`-connect`) peers are never punished, and
+private broadcast peers and local peers (including inbound onion connections, which
+all appear to come from localhost) are disconnected but not discouraged, since
+discouraging a shared address would punish everyone behind it.
+
+The call sites are few enough to list, which is itself a useful map of what the
+protocol considers unforgivable: `getblocktxn` with out-of-bounds indices, headers
+with invalid proof of work, non-continuous header sequences, a failed or
+non-matching compact block reconstruction, invalid `sendcmpct` fields, oversized
+`inv`, `getdata`, `headers`, `addr`, or `addrv2` messages, a mutated block, an
+oversized bloom filter or bad `filteradd`, and invalid blocks or headers routed
+through {repo}/src/net_processing.cpp#L2031[`MaybePunishNodeForBlock`], which
+switches on the block validation result described under <<consensus>> and
+punishes only for results that prove the peer relayed something invalid. There is
+no transaction counterpart: relaying an invalid *transaction* never leads to
+discouragement, because policy differs between nodes and a peer relaying something
+your node rejects is not necessarily dishonest.
+
+The `misbehaving_connection` USDT tracepoint is the convenient hook for watching
+this live; see {repo}/doc/tracing.md[`doc/tracing.md`].
+
+[[validation]]
+== `validation.{h,cpp}`
+
+The largest region, the historical core of the codebase, and still being broken up.
+Its job is verifying received data and maintaining the in-memory and on-disk
+chainstate.
+
+=== `Chainstate` and `ChainstateManager`
+
+{repo}/src/validation.h#L549[`Chainstate`] is one chain and its UTXO set;
+{repo}/src/validation.h#L949[`ChainstateManager`] owns the block index
+(`BlockManager`), the script check queue, the validation caches, and one or two
+`Chainstate` objects — two while an assumeutxo snapshot is being validated in the
+background (see the architecture document).
+
+Responsibilities split as follows. `ChainstateManager` handles everything that
+concerns the block tree as a whole: `ProcessNewBlockHeaders`, `AcceptBlockHeader`,
+`ProcessNewBlock`, and `AcceptBlock` (which checks a block against its header
+context and writes it to disk). `Chainstate` handles moving one chain's tip:
+`ActivateBestChain`, `ActivateBestChainStep`, `ConnectTip`, `DisconnectTip`, and
+`ConnectBlock`.
+
+The chain of calls when a block arrives:
+
+....
+PeerManagerImpl::ProcessMessage (BLOCK / BLOCKTXN / CMPCTBLOCK)
+  └─ ChainstateManager::ProcessNewBlock
+       ├─ CheckBlock                              → context-free checks (merkle root, size, ...)
+       ├─ ChainstateManager::AcceptBlock          → contextual header checks, write block to disk
+       └─ Chainstate::ActivateBestChain           → for the current chainstate (and the historical one, if any)
+            └─ Chainstate::ActivateBestChainStep  → disconnect back to the fork point, then connect forward
+                 └─ Chainstate::ConnectTip
+                      └─ Chainstate::ConnectBlock → inputs, scripts, subsidy; build undo data
+....
+
+Two points newcomers often miss. First, a block is written to disk in `AcceptBlock`
+*before* it is fully validated — it only needs a valid header and sufficient work.
+Full validation happens when (and if) it becomes part of the best chain, which is
+why an invalid block can sit in `blk*.dat` forever with an index entry marked
+`BLOCK_FAILED_VALID`. Second, `ActivateBestChain` does not validate one block and
+return; it loops, connecting blocks in batches and releasing `cs_main` between
+batches so that other threads (RPC, notifications) can make progress during a long
+sync.
+
+`net_processing` reaches all of this through a `ChainstateManager& m_chainman`
+member, which is the only coupling between the two regions.
+
+=== Validation caches
+
+{repo}/src/validation.h#L369[`ValidationCache`], owned by `ChainstateManager`,
+bundles the two caches that make re-validation cheap:
+
+[source,cpp]
+----
+class ValidationCache
+{
+private:
+    //! Pre-initialized hasher to avoid having to recreate it for every hash calculation.
+    CSHA256 m_script_execution_cache_hasher;
+
+public:
+    CuckooCache::cache<uint256, SignatureCacheHasher> m_script_execution_cache;
+    SignatureCache m_signature_cache;
+    // ...
+};
+----
+
+The script execution cache is keyed on the witness txid plus the verification flags,
+so a transaction validated on entry to the mempool need not have its scripts
+re-executed when it appears in a block under the same flags. The signature cache
+sits a level lower, memoising individual signature checks, which helps when only
+part of a transaction was seen before. Both are sized from `-maxsigcachesize`
+(default 32 MiB), split evenly between them. The hasher is salted with random data
+at startup so that an attacker cannot engineer cache collisions.
+
+=== Flushing
+
+{repo}/src/validation.h#L747[`Chainstate::FlushStateToDisk`] is called after
+chainstate changes with a {repo}/src/validation.h#L461[`FlushStateMode`] — `NONE`,
+`IF_NEEDED`, `PERIODIC`, `FORCE_FLUSH`, `FORCE_SYNC` — and decides, from cache
+pressure and elapsed time, whether to write. `IF_NEEDED` only flushes when the coins
+cache exceeds its budget; `PERIODIC` also flushes on a timer so that an unclean
+shutdown does not lose hours of sync progress.
+{repo}/src/validation.h#L753[`ForceFlushStateToDisk`] is the shutdown path.
+
+A full flush does three things, in an order that keeps the on-disk state consistent
+if the process dies part-way: block and undo files are synced to disk, dirty block
+index entries are written to the block index database, and then the coins cache is
+written to the chainstate database together with the best-block marker. Afterwards
+`ChainStateFlushed` is signalled so that indexes and wallets can record their own
+progress.
+
+=== Neighbouring code
+
+Several things that validation *uses* live elsewhere. Mempool persistence
+(`DumpMempool`/`LoadMempool`) is in
+{repo}/src/node/mempool_persist.h#L16[`node/mempool_persist.{h,cpp}`], called from
+shutdown and from the `initload` thread respectively. Block reading and writing is
+in `node/blockstorage`. Fee estimation is in `policy/fees/`. The mempool acceptance
+pipeline, `MemPoolAccept`, *does* live in `validation.cpp` and is described with the
+mempool below.
+
+[[blockstorage]]
+== `node/blockstorage.{h,cpp}`
+
+The centre of this region is {repo}/src/node/blockstorage.h#L193[`BlockManager`],
+which owns the on-disk block data and the in-memory block index — the
+`CBlockIndex` for every header the node has ever accepted, forming a tree rooted at
+genesis. The rest of the node reads and writes blocks only through it:
+
+* {repo}/src/node/blockstorage.h#L394[`WriteBlock`] appends a block to the current
+  `blk*.dat` file and returns its `FlatFilePos` (file number and offset).
+* {repo}/src/node/blockstorage.h#L474[`ReadBlock`] reads it back, by position or by
+  `CBlockIndex`, optionally checking that the hash matches.
+* {repo}/src/node/blockstorage.h#L383[`WriteBlockUndo`] and
+  {repo}/src/node/blockstorage.h#L478[`ReadBlockUndo`] do the same for undo data.
+* {repo}/src/node/blockstorage.h#L99[`BlockTreeDB`], a `CDBWrapper` subclass in the
+  `kernel` namespace, is the LevelDB database holding the block index.
+
+`BlockManager` also implements pruning (deleting old block and undo files once they
+are buried deep enough and the data is no longer needed by any index) and "prune
+locks", which let an index that has not caught up yet prevent the files it still
+needs from being deleted.
+
+The four kinds of data the node keeps on disk are the clearest mental model of the
+data directory:
+
+`blocks/blk*.dat`:: Raw blocks in network serialisation, appended in the order they
+were *received*, not chain order. Needed for rescans, reorgs, and serving blocks to
+peers. Each file is capped at
+{repo}/src/node/blockstorage.h#L124[`MAX_BLOCKFILE_SIZE`] (128 MiB).
+
+`blocks/rev*.dat`:: Undo data — for each block, the coins it spent, so that the node
+can roll the UTXO set backwards during a reorg.
+
+`blocks/index/`:: LevelDB metadata for every known block, including validation
+status and where on disk to find it.
+
+`chainstate/`:: LevelDB holding the UTXO set.
+
+The block files are XOR-obfuscated with a random per-datadir key stored in
+`blocks/xor.dat`. {repo}/doc/files.md[`doc/files.md`] documents the rest of the
+data directory. Each network gets its own subdirectory (`testnet3/`, `testnet4/`,
+`signet/`, `regtest/`); a custom signet (`-signetchallenge`) gets its own directory
+named with a suffix derived from its network magic, so several signets can be
+synced side by side.
+
+[[txmempool]]
+== `txmempool.{h,cpp}` and `txgraph.{h,cpp}`
+
+=== Acceptance
+
+Validation happens in `validation.cpp` before anything is inserted here. The
+{repo}/src/validation.cpp#L444[`MemPoolAccept`] class runs the checks in increasing
+order of cost, so that a bad transaction is rejected as cheaply as possible — which
+matters, because any peer can make you do this work for free:
+
+* {repo}/src/validation.cpp#L670[`PreChecks`] — everything except scripts:
+  standardness, size, finality, inputs available, fee and feerate, cluster limits,
+  and detecting conflicts with existing mempool transactions.
+* {repo}/src/validation.cpp#L673[`ReplacementChecks`] — the replace-by-fee rules
+  for a single transaction; {repo}/src/validation.cpp#L675[`PackageRBFChecks`] is
+  the package equivalent.
+* {repo}/src/validation.cpp#L681[`PolicyScriptChecks`] — scripts under the stricter
+  *policy* flags.
+* {repo}/src/validation.cpp#L687[`ConsensusScriptChecks`] — scripts again under
+  *consensus* flags, with the result stored in the script execution cache so that
+  block validation can skip it later. Because this populates a consensus-critical
+  cache, it must run even though policy checks already passed.
+* {repo}/src/validation.cpp#L690[`FinalizeSubpackage`] /
+  {repo}/src/validation.cpp#L695[`SubmitPackage`] — insertion, removing conflicts
+  first.
+* {repo}/src/validation.cpp#L700[`CheckFeeRate`] — enforcement of the dynamic
+  mempool minimum fee and `-minrelaytxfee`.
+
+The entry points are the `AcceptSingleTransaction...` and
+`AcceptMultipleTransactions...`/`AcceptPackage` variants, the latter handling
+packages: a child submitted together with parents whose own feerate is too low to
+get in alone (see {repo}/doc/policy/packages.md[`doc/policy/packages.md`]).
+Externally this region is reached through
+{repo}/src/validation.cpp#L4463[`ChainstateManager::ProcessTransaction`] and
+{repo}/src/validation.h#L287[`ProcessNewPackage`], both of which require `cs_main`.
+
+=== The entry
+
+{repo}/src/kernel/mempool_entry.h#L65[`CTxMemPoolEntry`] lives in `kernel/` and
+describes exactly *one* transaction:
+
+[source,cpp]
+----
+class CTxMemPoolEntry : public TxGraph::Ref
+{
+    // ...
+    const CTransactionRef tx;
+    const CAmount nFee;
+    const int32_t nTxWeight;
+    const size_t nUsageSize;
+    const int64_t nTime;
+    const uint64_t entry_sequence;
+    const unsigned int entryHeight;
+    const bool spendsCoinbase;
+    const int64_t sigOpCost;
+    mutable CAmount m_modified_fee;
+    // ...
+};
+----
+
+It stores no parents, children, or aggregate ancestor/descendant statistics.
+Relationships are not a property of an entry; they are a property of the graph, and
+the entry's base class, `TxGraph::Ref`, is its handle into that graph.
+`m_modified_fee` is the fee plus any `prioritisetransaction` delta, and is what
+mining and eviction use.
+
+=== The container, and `TxGraph`
+
+The entries are stored in a `boost::multi_index` container with three indices
+({repo}/src/txmempool.h#L214[`txmempool.h`]):
+
+[source,cpp]
+----
+using indexed_transaction_set = boost::multi_index_container<
+    CTxMemPoolEntry,
+    boost::multi_index::indexed_by<
+        // sorted by txid
+        boost::multi_index::hashed_unique<mempoolentry_txid, SaltedTxidHasher>,
+        // sorted by wtxid
+        boost::multi_index::hashed_unique<
+            boost::multi_index::tag<index_by_wtxid>, mempoolentry_wtxid, SaltedWtxidHasher>,
+        // sorted by entry time
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<entry_time>,
+            boost::multi_index::identity<CTxMemPoolEntry>,
+            CompareTxMemPoolEntryByEntryTime>
+    >
+>;
+----
+
+A `multi_index_container` is one set of objects with several ways of looking them
+up; here, by txid (for block and input lookups), by wtxid (for relay, which
+announces by wtxid), and by entry time (for expiry). Everything that depends on
+*relationships* — mining selection, eviction ordering, replacement comparison,
+ancestor and descendant queries — goes through
+{repo}/src/txmempool.h#L259[`m_txgraph`]:
+
+[source,cpp]
+----
+std::unique_ptr<TxGraph> m_txgraph GUARDED_BY(cs);
+mutable std::unique_ptr<TxGraph::BlockBuilder> m_builder GUARDED_BY(cs);
+----
+
+{repo}/src/txgraph.h[`TxGraph`] is deliberately Bitcoin-agnostic: it manipulates
+nodes, dependencies, fees and sizes, and answers questions about *clusters* — the
+connected components of the unconfirmed transaction graph — and their
+linearisations. `CTxMemPool` supplies the Bitcoin-specific policy on top. Many
+`CTxMemPool` methods are one-line forwards; `GetDescendantCount`, for example, is
+`m_txgraph->GetDescendants(...).size()`. `TxGraph` supports a *staging* level on
+top of the main graph, so a proposed change can be evaluated and then committed or
+discarded; the `TxGraph::Level::MAIN` arguments you see throughout `txmempool.h`
+select which level a query reads.
+
+Three consequences worth knowing:
+
+*Changesets.* {repo}/src/txmempool.h#L644[`CTxMemPool::ChangeSet`] batches a set of
+additions and removals into that staging level so they can be evaluated as a unit
+before being applied. {repo}/src/txmempool.h#L698[`CalculateChunksForRBF`] produces
+the before-and-after feerate diagrams that the replacement rules compare, which is
+how the node decides whether a replacement genuinely improves the mempool for
+miners.
+
+*Block building.* {repo}/src/txmempool.h#L744[`StartBlockBuilding`] creates a
+`TxGraph::BlockBuilder`, and `GetBlockBuilderChunk` then yields chunks in
+decreasing feerate order. Both the miner and the mempool-based fee estimator use
+this.
+
+*Limits.* Cluster limits (`-limitclustercount`, default 64 transactions;
+`-limitclustersize`, default 101 kvB) are the admission criterion.
+`-limitancestorcount` and `-limitdescendantcount` are deprecated and used only by
+the wallet's coin selection.
+
+{repo}/src/txmempool.h#L776[`CCoinsViewMemPool`] is a coins view that answers
+lookups from the UTXO set *and* from unconfirmed mempool outputs, so a transaction
+spending an unconfirmed parent can be validated and signed.
+
+[[coins]]
+== `coins.{h,cpp}` and `txdb.{h,cpp}`
+
+The layered cache over the UTXO set. A `Coin` is one unspent output plus the height
+and coinbase flag of the transaction that created it; a coins *view* is anything
+that can answer "is this outpoint unspent, and what is it?". Views stack, each
+falling back to the one below on a miss:
+
+* {repo}/src/coins.h#L355[`CCoinsView`] — abstract base. Besides `GetCoin` and
+  `HaveCoin` it has `PeekCoin`, a read that does not populate intermediate caches.
+* {repo}/src/coins.h#L391[`CoinsViewEmpty`] — a view with no coins, used as a
+  harmless base in tests and tools.
+* {repo}/src/txdb.h#L36[`CCoinsViewDB`] — the `chainstate/` LevelDB, holding every
+  unspent output.
+* {repo}/src/coins.h#L415[`CCoinsViewBacked`] — a view that forwards to another
+  view.
+* {repo}/src/coins.h#L807[`CCoinsViewErrorCatcher`] — wraps database reads so that
+  a read failure runs registered callbacks and then aborts the process, via
+  {repo}/src/coins.cpp#L430[`ExecuteBackedWrapper`]. Aborting is deliberate: a
+  failed read must never be mistaken for "coin not found", which would make a valid
+  block look invalid.
+* {repo}/src/coins.h#L436[`CCoinsViewCache`] — the in-memory cache, sized by
+  `-dbcache`. It tracks which entries are dirty (changed since last flush) and
+  which are fresh (created since then and absent from the parent), so a coin
+  created and spent between flushes never touches disk at all.
+* {repo}/src/coins.h#L655[`CoinsViewOverlay`] — a `CCoinsViewCache` subclass used
+  for one block at a time, with a `ThreadPool` for parallel prevout fetching.
+* {repo}/src/txmempool.h#L776[`CCoinsViewMemPool`] — adds unconfirmed outputs.
+
+`Chainstate` reaches all of this through
+{repo}/src/validation.h#L478[`CoinsViews`]:
+
+[source,cpp]
+----
+class CoinsViews {
+public:
+    //! The lowest level of the CoinsViews cache hierarchy sits in a leveldb database on disk.
+    CCoinsViewDB m_dbview GUARDED_BY(cs_main);
+
+    //! This view wraps access to the leveldb instance and handles read errors gracefully.
+    CCoinsViewErrorCatcher m_catcherview GUARDED_BY(cs_main);
+
+    //! This is the top layer of the cache hierarchy - it keeps as many coins in memory as
+    //! can fit per the dbcache setting.
+    std::unique_ptr<CCoinsViewCache> m_cacheview GUARDED_BY(cs_main);
+
+    //! Reused CoinsViewOverlay layered on top of m_cacheview and passed to ConnectBlock().
+    //! Reset between calls and flushed only on success, so invalid blocks don't pollute the underlying cache.
+    std::unique_ptr<CoinsViewOverlay> m_connect_block_view GUARDED_BY(cs_main);
+    // ...
+};
+----
+
+`m_connect_block_view` deserves attention. Block connection writes into this
+scratch overlay, which is flushed into `m_cacheview` only if the block turns out to
+be valid — so a block that fails late in validation cannot leave partial state in
+the main cache. It also carries the prevout-fetch thread pool described in the
+architecture document.
+
+Note the ordering constraint documented on the constructor: `m_cacheview` is
+created separately, by `InitCache`, only after the database has been checked,
+because the presence of a cache is what allows flushing to disk.
+
+[[dbwrapper]]
+== `dbwrapper.{h,cpp}` and `index/`
+
+{repo}/src/dbwrapper.h[`CDBWrapper`] wraps LevelDB: `Read`, `Write`, `Erase`,
+`Exists`, batched writes, and iteration, all taking serialisable keys and values.
+Three kinds of database are built on it — `CCoinsViewDB` for the chainstate,
+`BlockTreeDB` for the block index, and `BaseIndex::DB` for the optional indexes.
+
+Values are XOR-obfuscated with a random 8-byte key, originally added so that
+antivirus software would not quarantine the chainstate over byte patterns in
+transaction data. The key is an {repo}/src/util/obfuscation.h[`Obfuscation`] object
+held as `m_obfuscation` and stored, unobfuscated, under the reserved key
+{repo}/src/dbwrapper.h#L206[`\0obfuscate_key`].
+
+=== Indexes
+
+{repo}/src/index/base.h#L54[`BaseIndex`] implements `CValidationInterface`, so each
+index simply overrides {repo}/src/index/base.h#L127[`CustomAppend`] (and optionally
+`CustomRemove` for reorgs) and lets the base class handle block-connected events,
+the initial background sync, and restart. Each index runs its own sync thread,
+processes blocks from the fully validated chainstate strictly in order, and owns a
+{repo}/src/index/base.h#L64[`BaseIndex::DB`], a nested `CDBWrapper` subclass.
+
+[cols="2,1,3",options="header"]
+|===
+| Index | Flag | Purpose
+
+| `TxIndex`
+| `-txindex`
+| Locate any confirmed transaction by txid (`getrawtransaction` for non-wallet, non-mempool transactions). Required by block explorers.
+
+| `BlockFilterIndex`
+| `-blockfilterindex`
+| BIP157/158 compact block filters, served to light clients with `-peerblockfilters`. Compatible with pruning.
+
+| `CoinStatsIndex`
+| `-coinstatsindex`
+| Per-block UTXO set statistics, so `gettxoutsetinfo` need not scan the whole set.
+
+| `TxoSpenderIndex`
+| `-txospenderindex`
+| Maps each spent output to the transaction that spent it, used by `gettxspendingprevout` for confirmed spends.
+|===
+
+Databases live under `indexes/<name>/`. The txindex layout is a good example of
+index design under disk-space pressure; the comment at the top of
+{repo}/src/index/txindex_key.h#L23[`index/txindex_key.h`] documents it. Rather than
+mapping each full txid to a full disk position, it assigns each block a small
+sequence number and stores rows keyed by a salted hash prefix of the txid plus that
+block sequence number and the transaction's byte offset within the block, with an
+empty value. A lookup scans the (usually one) matching prefix and confirms the hit
+by reading the transaction. Older rows in the legacy layout are still readable.
+
+[[script]]
+== `script/` and `addresstype.{h,cpp}`
+
+=== Destinations and templates
+
+Two files outside `script/` are the place to start:
+
+* {repo}/src/addresstype.h[`src/addresstype.{h,cpp}`] — the *destination* types,
+  i.e. the things an address can denote, and conversion from a destination to a
+  script.
+* {repo}/src/script/solver.h[`script/solver.{h,cpp}`] — `Solver()`, which recognises
+  the standard script templates, and `GetScriptForDestination()`.
+
+{repo}/src/addresstype.h#L143[`CTxDestination`] is a `std::variant` over every
+destination kind:
+
+[source,cpp]
+----
+using CTxDestination = std::variant<CNoDestination, PubKeyDestination, PKHash,
+                                    ScriptHash, WitnessV0ScriptHash, WitnessV0KeyHash,
+                                    WitnessV1Taproot, PayToAnchor, WitnessUnknown>;
+----
+
+`PKHash` is P2PKH, `ScriptHash` is P2SH, the `WitnessV0` types are P2WSH and
+P2WPKH, `WitnessV1Taproot` is P2TR, and
+{repo}/src/addresstype.h#L123[`PayToAnchor`] is the `OP_1 <0x4e73>` pay-to-anchor
+output used for fee-bumping presigned transactions. `WitnessUnknown` covers future
+witness versions, so they can be sent to before this software knows how to spend
+them. `PubKeyDestination` (bare P2PK) and `CNoDestination` exist for scripts that
+have no address form. Encoding a destination as an address string (base58 or
+bech32/bech32m) is `key_io.cpp`'s job.
+
+=== The rest of the region
+
+`script.{h,cpp}`:: Opcodes and `CScript` (a `prevector<28, unsigned char>`, chosen to
+keep small scripts inline without a heap allocation), plus `CScriptNum` for the
+4-byte-operand, 64-bit-result arithmetic semantics.
+
+`interpreter.{h,cpp}`:: `EvalScript` executes opcodes; `VerifyScript` drives a full
+input verification, including witness and Taproot script paths. Signature hashing
+(`SignatureHash`) also lives here. Called from `CheckInputScripts` in validation.
+
+`verify_flags.h`:: `script_verify_flags`, a distinct type for sets of `SCRIPT_VERIFY_*`
+flags rather than a bare `unsigned int`.
+
+`sigcache.{h,cpp}`:: `CachingTransactionSignatureChecker`, backed by a
+`SignatureCache` that is a member of `ValidationCache`. It short-circuits repeated
+ECDSA and Schnorr verification.
+
+`sign.{h,cpp}`, `signingprovider.{h,cpp}`:: Transaction and PSBT signing, and the
+key/script lookup abstraction the signer uses, which lets the same signing code
+serve the wallet, `signrawtransactionwithkey`, and descriptors.
+
+`descriptor.{h,cpp}`:: Output script descriptors — the basis of the wallet. See
+{repo}/doc/descriptors.md[`doc/descriptors.md`].
+
+`miniscript.{h,cpp}`, `parsing.{h,cpp}`:: Miniscript, a structured language for
+spending conditions that maps to Bitcoin Script with analysable satisfaction costs
+and malleability properties, plus shared parsing helpers used by descriptors.
+
+[[consensus]]
+== `consensus/`
+
+The rules that cannot change without a fork. The constants in
+{repo}/src/consensus/consensus.h[`consensus/consensus.h`]:
+
+[source,cpp]
+----
+inline constexpr unsigned int MAX_BLOCK_SERIALIZED_SIZE{4'000'000};
+inline constexpr unsigned int MAX_BLOCK_WEIGHT{4'000'000};
+inline constexpr int64_t MAX_BLOCK_SIGOPS_COST{80'000};
+inline constexpr int COINBASE_MATURITY = 100;
+inline constexpr int WITNESS_SCALE_FACTOR = 4;
+inline constexpr size_t MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60;
+inline constexpr size_t MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10;
+// ...
+inline constexpr int64_t MAX_TIMEWARP = 600;
+----
+
+`MAX_TIMEWARP` bounds how far the first block of a difficulty period may be
+timestamped before the last block of the previous one, closing the timewarp attack
+(BIP94). Whether it is enforced is a per-network parameter,
+{repo}/src/consensus/params.h#L122[`enforce_BIP94`]: it is `true` on testnet4,
+configurable on regtest, and `false` on mainnet, testnet3, and signet. The check
+itself is in {repo}/src/validation.cpp#L4105[`ContextualCheckBlockHeader`]. The
+block template code applies this rule and the BIP54 rule on every network regardless
+(see <<mining>>).
+
+`MAX_MONEY` and `CAmount` are in
+{repo}/src/consensus/amount.h[`consensus/amount.h`].
+
+`tx_check.{h,cpp}` holds context-free transaction checks (`CheckTransaction`);
+`tx_verify.{h,cpp}` holds the contextual ones (`CheckTxInputs`, sequence locks,
+sigop counting). `merkle.{h,cpp}` computes `BlockMerkleRoot` and
+`BlockWitnessMerkleRoot`, and documents the merkle-tree malleability that
+`IsBlockMutated` guards against. `validation.h` here defines `TxValidationState` and
+`BlockValidationState`. Their result enums carry *why* something failed, which
+determines what happens next: `BlockValidationResult` values such as
+`BLOCK_CONSENSUS` or `BLOCK_MUTATED` decide in `MaybePunishNodeForBlock` whether the
+sending peer is punished, and `TxValidationResult` values such as `TX_CONSENSUS`,
+`TX_NOT_STANDARD`, or `TX_RECONSIDERABLE` decide whether a rejected transaction is
+remembered as invalid or retried as part of a package.
+
+=== Deployments
+
+Soft forks are activated in one of three ways, and
+{repo}/src/consensus/params.h#L26[`consensus/params.h`] reflects all three:
+
+*Buried* deployments (`BuriedDeployment`) are historical soft forks whose activation
+heights are hardcoded because they are far behind any reasonable reorg: BIP34
+(`DEPLOYMENT_HEIGHTINCB`), BIP65 (`DEPLOYMENT_CLTV`), BIP66 (`DEPLOYMENT_DERSIG`),
+CSV, and SegWit. They are checked by height comparison. The enum values are
+negative so that they can never collide with versionbits positions:
+
+[source,cpp]
+----
+enum BuriedDeployment : int16_t {
+    // buried deployments get negative values to avoid overlap with DeploymentPos
+    DEPLOYMENT_HEIGHTINCB = std::numeric_limits<int16_t>::min(),
+    DEPLOYMENT_CLTV,
+    DEPLOYMENT_DERSIG,
+    DEPLOYMENT_CSV,
+    DEPLOYMENT_SEGWIT,
+};
+----
+
+*Versionbits* deployments (`DeploymentPos`) are the BIP9 signalling machinery in
+{repo}/src/versionbits.h[`versionbits.{h,cpp}`] and
+{repo}/src/deploymentstatus.h[`deploymentstatus.{h,cpp}`], with human-readable names
+in `deploymentinfo.cpp`. At this commit the only entry is `DEPLOYMENT_TESTDUMMY`,
+used for testing — there is no soft fork in signalling.
+
+*Enforced from genesis.* P2SH (BIP16) and Taproot (BIP341/342) are applied to every
+block, with `script_flag_exceptions` in chain params listing the specific
+historical blocks that predate activation and would otherwise fail — one each on
+mainnet ({repo}/src/kernel/chainparams.cpp#L115[`chainparams.cpp`]). This is simpler
+than a height check and exactly as safe, since those blocks are immutable.
+
+Per-network values are set in
+{repo}/src/kernel/chainparams.cpp[`kernel/chainparams.cpp`] for mainnet, testnet3,
+testnet4, signet, and regtest.
+
+[[policy]]
+== `policy/`
+
+Local rules: what this node will relay and accept into its mempool, as distinct
+from what is valid in a block. A transaction can be perfectly valid yet
+non-standard; it will not be relayed by default, but a miner can still include it.
+
+`policy.{h,cpp}`:: `IsStandardTx`, `GetVirtualTransactionSize`, dust rules, and the
+standardness constants:
++
+[source,cpp]
+----
+inline constexpr int32_t MAX_STANDARD_TX_WEIGHT{400'000};
+inline constexpr unsigned int MIN_STANDARD_TX_NONWITNESS_SIZE{65};
+inline constexpr unsigned int MAX_STANDARD_TX_SIGOPS_COST{MAX_BLOCK_SIGOPS_COST/5};
+inline constexpr unsigned int DEFAULT_INCREMENTAL_RELAY_FEE{100};
+inline constexpr bool DEFAULT_PERMIT_BAREMULTISIG{true};
+inline constexpr unsigned int DUST_RELAY_TX_FEE{3000};
+inline constexpr unsigned int DEFAULT_MIN_RELAY_TX_FEE{100};
+inline constexpr unsigned int MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR;
+----
++
+Fee constants are in satoshis per 1,000 virtual bytes, so
+{repo}/src/policy/policy.h#L70[`DEFAULT_MIN_RELAY_TX_FEE`] of 100 is 0.1 sat/vB.
+`MAX_OP_RETURN_RELAY` equals the standard transaction size limit, so in practice the
+data-carrier size is bounded by transaction size rather than by a separate small
+constant. Both are *policy*, adjustable per node (`-minrelaytxfee`,
+`-datacarriersize`), and both have been the subject of substantial public debate —
+treat any one-line summary of the reasoning, including this one, as a starting
+point rather than a settled account.
+
+`truc_policy.{h,cpp}`:: Topologically Restricted Until Confirmation — version 3
+transactions (BIP431). Opting in buys tighter topology limits (one unconfirmed
+parent, one unconfirmed child, small child size) in exchange for reliable
+fee-bumping, which is what makes pinning-resistant contracting protocols such as
+Lightning practical.
+
+`ephemeral_policy.{h,cpp}`:: Ephemeral dust: allows a transaction to create a dust
+output provided it is spent by a child in the same package, enabling anchor outputs
+without permanently bloating the UTXO set.
+
+`packages.{h,cpp}`:: Package validation rules — what constitutes a well-formed
+package (topologically sorted, no conflicts, child-with-parents shape) and the
+limits on its size.
+
+`rbf.{h,cpp}`:: Replace-by-fee rules, working with the feerate diagrams produced by
+`TxGraph`. See {repo}/doc/policy/mempool-replacements.md[`doc/policy/mempool-replacements.md`].
+
+`feerate.{h,cpp}`:: `CFeeRate`, satoshis per kvB.
+
+`fees/`:: Fee estimation:
++
+* {repo}/src/policy/fees/estimator_man.h#L27[`estimator_man.{h,cpp}`] —
+  `FeeRateEstimatorManager`, the `CValidationInterface` subscriber that owns both
+  estimators, feeds them events, and combines their answers.
+* `block_policy_estimator.{h,cpp}` — `CBlockPolicyEstimator`, which learns from how
+  long past transactions in each feerate bucket took to confirm. Answers targets up
+  to about 1,000 blocks; persisted in `fee_estimates.dat`.
+* {repo}/src/policy/fees/mempool_estimator.h#L87[`mempool_estimator.{h,cpp}`] —
+  `MemPoolFeeRateEstimator`, which builds a block template from the current mempool
+  and reads percentile chunk feerates from it. Answers targets of one or two blocks,
+  and only when recent blocks show the local mempool was representative of what
+  miners included.
+* `estimator_args.{h,cpp}` — translating command-line options.
+
+[[kernel]]
+== `kernel/`
+
+`libbitcoin_kernel` is the validation engine packaged so it can be used without a
+node: no P2P, no RPC, no wallet.
+
+What lives here is a good definition of "consensus-critical plus what it needs":
+{repo}/src/kernel/chainparams.cpp[`chainparams`],
+{repo}/src/kernel/cs_main.h[`cs_main`] itself,
+{repo}/src/kernel/mempool_entry.h[`mempool_entry`], mempool options, limits, and
+removal reasons, `disconnected_transactions` (holding transactions from blocks
+disconnected in a reorg until they can be re-added to the mempool), `coinstats`,
+`chain`, the {repo}/src/kernel/types.h[`ChainstateRole`] type, and the
+{repo}/src/kernel/notifications_interface.h[`kernel::Notifications`] interface
+through which the engine reports progress, warnings, and fatal errors to whatever
+is embedding it. Constructing a `kernel::Context` performs one-time global setup
+the library depends on, such as selecting the SHA256 implementation and
+initialising the random number generator.
+
+The public surface is a C API in
+{repo}/src/kernel/bitcoinkernel.h[`bitcoinkernel.h`] (functions prefixed `btck_`)
+with a C++ RAII wrapper alongside it. It is experimental and gated behind
+`BUILD_KERNEL_LIB`. The demonstration consumer is
+{repo}/src/bitcoin-chainstate.cpp[`bitcoin-chainstate`].
+
+Alone among the libraries, `libbitcoin_kernel` is intended to eventually have a
+stable documented interface. The others are explicitly unstable.
+
+[[node]]
+== `node/`
+
+Node-level glue: everything that is neither consensus-critical nor
+network-protocol-specific, in the `node::` namespace. A lot of what `init.cpp` does
+is delegated here.
+
+Highlights beyond those already covered:
+
+* `*_args.cpp` files — `chainstatemanager_args`, `mempool_args`,
+  `blockmanager_args`, `peerman_args`, `database_args`, `coins_view_args`,
+  `mining_args`, `mempool_persist_args`. Each translates `ArgsManager` settings into
+  a typed options struct, so the subsystems themselves never read command-line
+  arguments. This is the pattern that lets the kernel be configured
+  programmatically, and it is the first place to look when you want to know what a
+  command-line option actually controls.
+* `chainstate.cpp` — `LoadChainstate` and `VerifyLoadedChainstate`, the startup
+  sequence for opening databases and loading the block index.
+* `caches.cpp` — splitting the `-dbcache` budget between the coins cache, the block
+  index, and indexes.
+* {repo}/src/node/kernel_notifications.h[`kernel_notifications`] — the node's
+  implementation of the kernel notification interface.
+* {repo}/src/node/warnings.h[`warnings`] — node warnings as a managed object.
+* `transaction.cpp` — `BroadcastTransaction` and `GetTransaction`.
+* `txdownloadman*`, `txorphanage`, `txreconciliation` — transaction download,
+  orphan handling, and Erlay set-reconciliation state, used by `net_processing`.
+* `eviction.cpp` — the inbound peer eviction algorithm, which protects peers with
+  useful properties (low latency, recent blocks and transactions, network
+  diversity) when the node is full.
+* `timeoffsets.cpp` — tracking peers' clock offsets to warn when the local clock
+  looks wrong.
+* `utxo_snapshot.cpp` — assumeutxo snapshot metadata and file handling.
+* `psbt.cpp` — PSBT analysis.
+* `interfaces.cpp` — the node-side implementations of the `interfaces/` classes.
+* `mini_miner.cpp` — a lightweight block-template simulator used to calculate the
+  cost of bumping unconfirmed ancestors.
+* `block_template_manager.cpp`, `miner.cpp` — see <<mining>>.
+
+[[interfaces]]
+== `interfaces/` and `ipc/`
+
+Why should the wallet not simply call the fee estimator directly? Because every
+direct call from wallet code into node code is a dependency that has to be cut
+before the two can run in separate processes. The answer the tree adopts is a set
+of abstract interfaces that are the *only* way across.
+
+The wallet does not hold a `NodeContext`. `CWallet` holds an `interfaces::Chain*`
+and calls, for example, `wallet.chain().getFeeRateEstimate(...)`. The
+implementation on the other side may be an in-process call or a Cap'n Proto message
+across a socket, and the wallet cannot tell.
+
+The interfaces:
+
+* {repo}/src/interfaces/chain.h[`Chain`] — used by the wallet to read chain and
+  mempool state, broadcast transactions, and subscribe to notifications. At around
+  60 methods it is the widest boundary in the tree.
+* `ChainClient` — used by the node to start, stop, and flush chain clients (the
+  wallet is one).
+* {repo}/src/interfaces/node.h[`Node`] — used by the GUI to control and query the
+  node.
+* {repo}/src/interfaces/wallet.h[`Wallet`, `WalletLoader`] — used by the GUI and
+  node to drive wallets.
+* {repo}/src/interfaces/mining.h#L107[`Mining`] — block template creation and
+  submission; see <<mining>>.
+* {repo}/src/interfaces/rpc.h#L19[`Rpc`] — lets a client (`bitcoin-cli
+  -ipcconnect`) execute an RPC request as if it had arrived over HTTP.
+* {repo}/src/interfaces/init.h[`Init`] and {repo}/src/interfaces/ipc.h[`Ipc`] —
+  process startup and IPC connection management. `Init` is the first object
+  exchanged when two processes connect, and every other interface is obtained from
+  it (`makeChain()`, `makeMining()`, …).
+* `Echo` — a trivial interface used to test the IPC plumbing end to end.
+
+{tree}/src/ipc[`src/ipc/`] holds the Cap'n Proto schemas (`init`, `echo`, `mining`,
+`rpc`, `common`), process spawning, and the vendored libmultiprocess subtree. An
+interface is usable across processes only once it has a schema; `Chain`, `Node`,
+and `Wallet` do not yet, which is why the node, wallet, and GUI still run in one
+process. `ENABLE_IPC` defaults to `ON` on non-Windows. See
+{repo}/doc/design/multiprocess.md[`doc/design/multiprocess.md`] and
+{repo}/src/interfaces/README.md[`src/interfaces/README.md`].
+
+[[rpc]]
+== `rpc/`
+
+{repo}/src/rpc/server.h#L88[`CRPCTable`] is the dispatch table;
+{repo}/src/rpc/server.h#L41[`CRPCCommand`] is one entry. Methods are declared with
+`RPCHelpMan` (in `rpc/util.h`), which serves several purposes at once: it generates
+the `help` text, validates and converts arguments (including named arguments), and
+describes the result shape — which the test suite checks against actual output, so
+the documentation cannot silently drift from the implementation. The same metadata
+feeds the OpenRPC description of the API.
+
+Files are grouped by subject: `blockchain.cpp`, `mempool.cpp`, `mining.cpp`,
+`net.cpp`, `node.cpp`, `rawtransaction.cpp`, `output_script.cpp`, `signmessage.cpp`,
+`txoutproof.cpp`, `fees.cpp`, `external_signer.cpp`. Wallet RPCs live separately
+under {tree}/src/wallet/rpc[`wallet/rpc/`], which is what allows them to be absent
+when the wallet is compiled out. `server_util.cpp` has the helpers RPC methods use to
+reach components in `NodeContext` (`EnsureChainman`, `EnsureMemPool`, …), each of
+which throws a clean RPC error if that component is disabled. `client.cpp` is the
+`bitcoin-cli` side, deciding which positional arguments are JSON rather than
+strings.
+
+The HTTP transport underneath (`httpserver.cpp`, `httprpc.cpp`, `rest.cpp`) is a
+separate concern and is covered in the architecture document.
+
+[[qt]]
+== `qt/`
+
+Around 59 translation units implementing the Qt GUI. It talks to the node through
+`interfaces::Node` and to wallets through `interfaces::Wallet`, never directly. The
+GUI-specific issue tracker and pull requests live in a separate repository,
+https://github.com/bitcoin-core/gui[bitcoin-core/gui], and are merged into the main
+tree from there.
+
+Project convention: new features are exposed on RPC first and only then in the GUI,
+because the RPC test surface is far stronger than the GUI's.
+
+[[wallet]]
+== `wallet/`
+
+Descriptor wallets stored in SQLite. {repo}/src/wallet/migrate.h[`migrate.{h,cpp}`]
+contains a self-contained reader for legacy Berkeley DB files, used only for
+one-way migration to descriptor wallets.
+
+* `wallet.{h,cpp}` — `CWallet`, holding `interfaces::Chain* m_chain`, the
+  transaction map, and the `ScriptPubKeyMan`s. `CWallet` implements
+  `interfaces::Chain::Notifications` to learn about blocks and mempool changes.
+* `scriptpubkeyman.{h,cpp}` — `DescriptorScriptPubKeyMan`, which derives and tops up
+  script pubkeys from descriptors, and decides which outputs are "ours".
+* `transaction.{h,cpp}`, `receive.{h,cpp}` — `CWalletTx` and balance/credit
+  computation.
+* `coinselection.{h,cpp}`, `spend.{h,cpp}` — the coin selection algorithms (branch
+  and bound, CoinGrinder, knapsack, single random draw) and transaction
+  construction.
+* {repo}/src/wallet/scan.h#L57[`scan.{h,cpp}`] — `ChainScanner` and
+  `WalletRescanReserver`: rescanning blocks for wallet-relevant transactions, used
+  on import and by `rescanblockchain`.
+* `imports.{h,cpp}`, `export.{h,cpp}` — descriptor import and export logic shared by
+  RPC and the GUI.
+* `fees.{h,cpp}` — choosing a feerate for wallet transactions, including the
+  fallback when the node has no estimate.
+* `sqlite.{h,cpp}`, `walletdb.{h,cpp}`, `db.{h,cpp}` — storage.
+* `crypter.{h,cpp}` — wallet encryption.
+* `feebumper.{h,cpp}` — RBF fee bumping.
+* `external_signer_scriptpubkeyman.{h,cpp}` — hardware wallet support through
+  HWI-compatible external signers.
+* `rpc/` — wallet RPC methods.
+* `wallettool.{h,cpp}` — the `bitcoin-wallet` offline tool.
+
+See {repo}/doc/managing-wallets.md[`doc/managing-wallets.md`] and
+{repo}/doc/descriptors.md[`doc/descriptors.md`].
+
+[[mining]]
+== Mining: `node/block_template_manager`, `node/miner`, `interfaces/mining.h`
+
+Three layers:
+
+{repo}/src/node/block_template_manager.h#L32[`node::BlockTemplateManager`], held as
+`NodeContext::block_template_manager`, is the node's single mining service. It
+creates templates (applying the block-creation options read from the command line
+at startup), submits solved blocks through `ProcessNewBlock` while capturing the
+validation result, and provides the tip-waiting helpers.
+
+{repo}/src/node/miner.h#L50[`BlockAssembler`] builds one template from the mempool.
+It starts a `TxGraph::BlockBuilder` and takes chunks in decreasing feerate order
+until the block is full, then builds the coinbase and computes the witness
+commitment. {repo}/src/node/miner.cpp#L50[`GetMinimumTime`] enforces two
+timestamp rules on *every* network, whether or not they are consensus there: the
+BIP94 timewarp limit at the start of a difficulty period, and the BIP54 rule that
+the last block of a period may not be earlier than its first. Mining templates that
+already satisfy proposed rules makes a future activation safer.
+
+{repo}/src/interfaces/mining.h#L107[`interfaces::Mining`] exposes this to clients:
+`getTip`, `waitTipChanged`, `createNewBlock`, `checkBlock`, and a `BlockTemplate`
+handle with `waitNext`, which returns a fresh template when the tip changes or fees
+rise enough to be worth it — replacing `getblocktemplate` polling with
+notification. Instances are created on demand by
+{repo}/src/node/interfaces.cpp#L1073[`MakeMining`]. The RPC mining calls use it, and
+it is exported over IPC so that mining software such as a Stratum v2 template
+provider can drive the node directly. `node/mining_types.h` defines the option
+structs and is deliberately kept usable by those external clients.
+
+[[common]]
+== `common/` and `util/`
+
+The bottom of the stack, split by level. `libbitcoin_util` is lower-level and has
+no Bitcoin-specific knowledge: threads, `ThreadPool`, sockets, strings, filesystem,
+time, logging, `SignalInterrupt`, `Obfuscation`, and `util::Result`/`util::Expected`
+for error returns. `libbitcoin_common` is higher-level but still shared by every
+executable: `ArgsManager` and settings (`common/args.h`, `common/settings.h`), the
+`bitcoin.conf` parser, `bloom`, `signmessage`, `netif`, `pcp` (port mapping),
+`run_command`, and {repo}/src/common/bip352.h#L37[`bip352`] — the BIP352 Silent
+Payments send and receive computations, implemented on top of libsecp256k1's
+silent payments module and not yet used by the wallet.
+
+The distinction is enforced by the dependency graph in
+{repo}/doc/design/libraries.md[`libraries.md`] and is worth respecting: putting
+something in `util/` that depends on `common/` will fail the build for
+non-obvious-looking reasons.
+
+Vendored third-party code — `leveldb`, `secp256k1`, `minisketch`, `crc32c`,
+`crypto/ctaes`, and `ipc/libmultiprocess` — is maintained as git subtrees under
+`src/` and updated only by dedicated "Update … subtree" pull requests. Do not edit
+it in place.
+
+== References
+
+* {repo}/doc/design/libraries.md[`doc/design/libraries.md`] — the authoritative
+  library map and dependency graph; read this before trusting any region diagram,
+  including the one above
+* {repo}/doc/design/multiprocess.md[`doc/design/multiprocess.md`]
+* {repo}/doc/design/assumeutxo.md[`doc/design/assumeutxo.md`]
+* {repo}/doc/developer-notes.md[`doc/developer-notes.md`] — locking discipline,
+  logging, threads
+* {repo}/src/interfaces/README.md[`src/interfaces/README.md`],
+  {repo}/src/node/README.md[`src/node/README.md`]
+* {repo}/doc/files.md[`doc/files.md`] — data directory layout
+* {repo}/doc/descriptors.md[`doc/descriptors.md`],
+  {repo}/doc/managing-wallets.md[`doc/managing-wallets.md`]
+* {tree}/doc/policy[`doc/policy/`] — mempool design, terminology, replacement rules,
+  and package relay
+* {repo}/doc/tracing.md[`doc/tracing.md`] — USDT tracepoints
+* https://bitcoincore.reviews[Bitcoin Core PR Review Club] — the best way to track
+  changes to these regions as they land
+* https://doxygen.bitcoincore.org[doxygen.bitcoincore.org] — class hierarchies and
+  call graphs
+* https://bitcoincore.academy[Onboarding to Bitcoin Core] — Chaincode's current
+  curriculum
+
+[NOTE]
+====
+Verification note: class names, line anchors, constants, file listings, and
+directory contents above were read from the tree at
+`4b612c6bf8cfa319a9df130d4b3d0523fddb6579`. Code excerpts are abridged — `// ...`
+marks elisions — and are reproduced under Bitcoin Core's MIT licence for technical
+explanation. Where the rationale for a design decision is contested, that is noted
+rather than smoothed over.
+====
