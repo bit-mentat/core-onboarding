@@ -1,0 +1,942 @@
+= 1.2 The Lifecycle of a Transaction
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 2
+:icons: font
+:source-highlighter: highlight.js
+:repo: https://github.com/bitcoin/bitcoin/blob/4303f3b7f0775cdbbe77faddf142e1e44fa590ca
+:tree: https://github.com/bitcoin/bitcoin/tree/4303f3b7f0775cdbbe77faddf142e1e44fa590ca
+:pr: https://github.com/bitcoin/bitcoin/pull
+
+[NOTE]
+====
+Third in the series, after `1.0_bitcoin_core_architecture.asciidoc` (processes,
+threads, control flow) and `1.1_regions.asciidoc` (the static decomposition of the
+tree). Those two were pinned to `e34b8d5a7d` in July 2026; this one is pinned to
+{repo}[`4303f3b7f0775cdbbe77faddf142e1e44fa590ca`] (20 October 2026), which is
+`master` at version `32.99.0` — v33 development, with v32 released in the interval.
+
+Where the earlier documents describe structure, this one follows a single
+transaction all the way through: from the moment you type `createrawtransaction`
+to the moment a peer's node inserts it into its own mempool and tells its
+subscribers about it. Every stage names the function that does the work.
+
+One change since the other two documents is worth flagging up front because it
+touches this trace directly: RPC methods now return `RPCMethod` rather than
+`RPCHelpMan`, and transaction announcement has been rebuilt around a globally
+rate-limited backlog. Both are described in place below.
+====
+
+== Scope and shape of the trace
+
+....
+┌─ YOUR NODE ─────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  1. createrawtransaction    → CMutableTransaction, unsigned              │
+│  2. signrawtransactionwithkey → scriptSig / witness filled in            │
+│  3. sendrawtransaction      → BroadcastTransaction                       │
+│  4.   └─ ChainstateManager::ProcessTransaction → MemPoolAccept           │
+│  5.   └─ mempool insertion + TransactionAddedToMempool                   │
+│  6.   └─ InitiateTxBroadcastToAll → global inv backlog                   │
+│  7. SendMessages → INV  ───────────────────────────────────────────┐     │
+└────────────────────────────────────────────────────────────────────┼─────┘
+                                                                     │
+┌─ PEER'S NODE ───────────────────────────────────────────────────────┼─────┐
+│  8. ProcessMessage(INV) → TxDownloadManager::AddTxAnnouncement      │     │
+│  9. SendMessages → GETDATA  ───────────────────────────────────┐    │     │
+└────────────────────────────────────────────────────────────────┼────┼─────┘
+                                                                 │    │
+┌─ YOUR NODE ─────────────────────────────────────────────────────┼────┼─────┐
+│ 10. ProcessGetData → FindTxForGetData → TX message  ────────┐  │    │     │
+└─────────────────────────────────────────────────────────────┼──┼────┼─────┘
+                                                              │  │    │
+┌─ PEER'S NODE ────────────────────────────────────────────────┼──┼────┼─────┐
+│ 11. ProcessMessage(TX) → TxDownloadManager::ReceivedTx       │  │    │     │
+│ 12. ChainstateManager::ProcessTransaction → MemPoolAccept    │  │    │     │
+│ 13. mempool insertion + TransactionAddedToMempool  ← DONE    │  │    │     │
+│ 14. ProcessValidTx → relays onward to its own peers          │  │    │     │
+└──────────────────────────────────────────────────────────────┴──┴────┴─────┘
+....
+
+Steps 1–2 are deliberately the *raw* path rather than the wallet path. Using
+`createrawtransaction`/`signrawtransactionwithkey` means every field is explicit,
+with no coin selection, change handling or fee estimation in the way. A real wallet
+spend reaches the same place by a longer road — see <<wallet-path>>.
+
+Throughout, remember the threading rule from 1.0: steps 3–6 run on the RPC worker
+thread (`b-http.NN`), everything from step 7 onward runs on the message-handling
+thread (`b-msghand`), and `g_msgproc_mutex` is held for the whole of the latter.
+
+== Stage 1 — Constructing the raw transaction
+
+`createrawtransaction` lives in
+{repo}/src/rpc/rawtransaction.cpp#L403[`src/rpc/rawtransaction.cpp`]. Note the
+declaration style, which changed since the earlier documents in this series:
+
+[source,cpp]
+----
+static RPCMethod createrawtransaction()
+{
+    return RPCMethod{
+        "createrawtransaction",
+        // description, args, results, examples ...
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+        {
+            // ...
+        },
+    };
+}
+----
+
+{repo}/src/rpc/util.h#L444[`RPCMethod`] replaces the old `RPCHelpMan`. It still does
+the same triple duty — generating help text, validating and converting arguments,
+and documenting the result shape — and the dispatch table at the bottom of the file
+registers it with `{"rawtransactions", &createrawtransaction}`.
+
+The real work is
+{repo}/src/rpc/rawtransaction_util.cpp#L161[`ConstructTransaction(...)`]:
+
+[source,cpp]
+----
+CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in,
+                                         const UniValue& locktime, std::optional<bool> rbf,
+                                         const uint32_t version)
+{
+    CMutableTransaction rawTx;
+
+    if (!locktime.isNull()) {
+        int64_t nLockTime = locktime.getInt<int64_t>();
+        if (nLockTime < 0 || nLockTime > LOCKTIME_MAX)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, locktime out of range");
+        rawTx.nLockTime = nLockTime;
+    }
+
+    if (version < TX_MIN_STANDARD_VERSION || version > TX_MAX_STANDARD_VERSION) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid parameter, version out of range(%d~%d)",
+                                                            TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION));
+    }
+    rawTx.version = version;
+
+    AddInputs(rawTx, inputs_in, rbf);
+    AddOutputs(rawTx, outputs_in);
+
+    if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 && !SignalsOptInRBF(CTransaction(rawTx))) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "Invalid parameter combination: Sequence number(s) contradict replaceable option");
+    }
+
+    return rawTx;
+}
+----
+
+{repo}/src/rpc/rawtransaction_util.cpp#L35[`AddInputs`] builds each `CTxIn` from a
+txid/vout pair and sets `nSequence` — this is where the RBF signal is actually
+chosen. {repo}/src/rpc/rawtransaction_util.cpp#L147[`AddOutputs`] decodes each
+address to a `CTxDestination` and calls `GetScriptForDestination` (the
+`script/solver.{h,cpp}` function from 1.1) to produce the `scriptPubKey`, or builds
+an `OP_RETURN` output for a `data` entry.
+
+Two things are worth noticing here. The version range check against
+`TX_MIN_STANDARD_VERSION`/`TX_MAX_STANDARD_VERSION` is what admits version 3 (TRUC)
+transactions; the topology restrictions that come with version 3 are enforced much
+later, at mempool acceptance. And the node has not consulted its UTXO set at all —
+it will happily construct a transaction spending outputs that do not exist. Nothing
+is validated yet.
+
+=== The two transaction types
+
+{repo}/src/primitives/transaction.h#L175[`CMutableTransaction`] has public,
+writable `vin`, `vout`, `version` and `nLockTime`.
+{repo}/src/primitives/transaction.h#L286[`CTransaction`] is the immutable form,
+which caches its txid and wtxid at construction. The whole pipeline moves in one
+direction: mutable while being built and signed, then converted once via
+`MakeTransactionRef(std::move(mtx))` into a `CTransactionRef` (a
+`shared_ptr<const CTransaction>`) for everything downstream. Once it is a
+`CTransactionRef`, its identity is fixed and cheap to hash-compare.
+
+The RPC returns the hex serialisation. Nothing has touched the mempool, the UTXO
+set, or the network.
+
+== Stage 2 — Signing
+
+`signrawtransactionwithkey`
+({repo}/src/rpc/rawtransaction.cpp#L716[`rawtransaction.cpp`]) needs two things the
+raw transaction does not carry: the private keys, and the *previous outputs* being
+spent — because a signature commits to the value and `scriptPubKey` of each input.
+
+{repo}/src/rpc/rawtransaction_util.cpp#L204[`ParsePrevouts`] fills a
+`std::map<COutPoint, Coin>` from the user-supplied `prevtxs` argument and loads keys
+into a `FlatSigningProvider`. The RPC wrapper then calls
+{repo}/src/rpc/rawtransaction_util.cpp#L325[`SignTransaction`], which resolves the
+sighash type and delegates to the real implementation in
+{repo}/src/script/sign.cpp[`script/sign.cpp`]:
+
+[source,cpp]
+----
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore,
+                     const std::map<COutPoint, Coin>& coins, const SignOptions& options,
+                     std::map<int, bilingual_str>& input_errors)
+{
+    // Use CTransaction for the constant parts of the transaction to avoid rehashing.
+    const CTransaction txConst(mtx);
+
+    PrecomputedTransactionData txdata;
+    std::vector<CTxOut> spent_outputs;
+    // ... collect spent outputs, then:
+    if (spent_outputs.size() == mtx.vin.size()) {
+        txdata.Init(txConst, std::move(spent_outputs), true);
+    }
+
+    // Sign what we can:
+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+        CTxIn& txin = mtx.vin[i];
+        auto coin = coins.find(txin.prevout);
+        if (coin == coins.end() || coin->second.IsSpent()) {
+            input_errors[i] = _("Input not found or already spent");
+            continue;
+        }
+        const CScript& prevPubKey = coin->second.out.scriptPubKey;
+        const CAmount& amount = coin->second.out.nValue;
+
+        SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out);
+        ProduceSignature(*keystore,
+                         MutableTransactionSignatureCreator(mtx, i, amount, &txdata, options),
+                         prevPubKey, sigdata);
+
+        UpdateInput(txin, sigdata);
+        // ...
+    }
+    // ...
+}
+----
+
+Three pieces are doing the work:
+
+`PrecomputedTransactionData`:: Caches the midstate hashes that segwit and taproot
+sighashes share across inputs (`hashPrevouts`, `hashSequence`, `hashOutputs`, and
+the taproot equivalents). Without it, signing an n-input transaction would be
+O(n²). Note `txdata.Init(..., /*force=*/true)` in the fallback branch — if any
+spent output is missing, it initialises what it can rather than failing outright,
+because partial signing is a legitimate outcome.
+
+{repo}/src/script/sign.cpp#L750[`ProduceSignature`]:: The generic satisfier. It
+calls `Solver()` to classify the `scriptPubKey`, then recursively produces the
+required signatures and script pushes for that template, descending through P2SH
+and P2WSH wrappers. `SignatureData` accumulates the result, and can carry partial
+signatures — which is exactly what makes PSBT work with the same machinery.
+
+{repo}/src/script/sign.cpp#L54[`MutableTransactionSignatureCreator::CreateSig`]::
+Computes the sighash and produces the actual signature. ECDSA goes through
+{repo}/src/script/interpreter.cpp#L1610[`SignatureHash`]; taproot key-path spends
+go through {repo}/src/script/interpreter.cpp#L1493[`SignatureHashSchnorr`]
+(BIP341). This is the one place in the trace where a private key is used.
+
+`UpdateInput` writes the finished `scriptSig` and `scriptWitness` back into the
+mutable transaction. The RPC reports `complete: true` only if every input was
+satisfied.
+
+The transaction is now a valid, fully-formed object — but still only in the RPC
+process's memory.
+
+== Stage 3 — `sendrawtransaction`
+
+`sendrawtransaction` does *not* live in `rawtransaction.cpp`. It is in
+{repo}/src/rpc/mempool.cpp#L79[`src/rpc/mempool.cpp`], which is the better home for
+it: the operation is a mempool submission, not a transaction-manipulation utility.
+
+[source,cpp]
+----
+CMutableTransaction mtx;
+if (!DecodeHexTx(mtx, request.params[0].get_str())) {
+    throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed. ...");
+}
+
+for (const auto& out : mtx.vout) {
+    if ((out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps())
+        && out.nValue > max_burn_amount) {
+        throw JSONRPCTransactionError(TransactionError::MAX_BURN_EXCEEDED);
+    }
+}
+
+CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
+// ...
+const auto method = private_broadcast_enabled ? node::TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
+                                              : node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
+const TransactionError err = BroadcastTransaction(node, tx, err_string,
+                                                  /*max_tx_fee=*/0, max_raw_tx_fee_rate,
+                                                  method, /*wait_callback=*/true);
+----
+
+The burn check is a footgun guard, not a consensus rule: it refuses to broadcast
+value sent to a provably unspendable script unless you explicitly raise
+`maxburnamount`.
+
+More interesting is `broadcast_method`. Private broadcast — the `b-privbcast`
+thread from 1.0 — is now wired into the normal send path through
+{repo}/src/node/types.h#L36[`node::TxBroadcast`]:
+
+[source,cpp]
+----
+enum class TxBroadcast : uint8_t {
+    /// Add the transaction to the mempool and broadcast to all peers for which tx relay is enabled.
+    MEMPOOL_AND_BROADCAST_TO_ALL,
+    /// Add the transaction to the mempool, but don't broadcast to anybody.
+    MEMPOOL_NO_BROADCAST,
+    /// Omit the mempool and directly send the transaction via a few dedicated connections to
+    /// peers on privacy networks.
+    NO_MEMPOOL_PRIVATE_BROADCAST,
+};
+----
+
+With `-privatebroadcast` enabled the RPC first refuses to proceed unless Tor or I2P
+is actually reachable — a nice piece of fail-closed design, since silently falling
+back to clearnet broadcast would defeat the entire point. This trace follows
+`MEMPOOL_AND_BROADCAST_TO_ALL`.
+
+== Stage 4 — `BroadcastTransaction`
+
+{repo}/src/node/transaction.cpp[`node/transaction.cpp`] is the shared entry point
+for both RPC and wallet broadcasts. It runs under `cs_main` and does its work in a
+deliberate order.
+
+First, two early exits. If any of the transaction's own outputs already exists in
+the UTXO set, the transaction is already confirmed:
+
+[source,cpp]
+----
+CCoinsViewCache &view = node.chainman->ActiveChainstate().CoinsTip();
+for (size_t o = 0; o < tx->vout.size(); o++) {
+    const Coin& existingCoin = view.AccessCoin(COutPoint(txid, o));
+    // IsSpent doesn't mean the coin is spent, it means the output doesn't exist.
+    // So if the output does exist, then this transaction exists in the chain.
+    if (!existingCoin.IsSpent()) return TransactionError::ALREADY_IN_UTXO_SET;
+}
+----
+
+Second, if a transaction with this txid is already in the mempool, it skips
+submission (which would be rejected as a conflict) but keeps the *mempool's* wtxid
+for re-announcement — the two may differ if the witness differs.
+
+Otherwise it submits. Note the two-phase structure when a fee cap is in play:
+
+[source,cpp]
+----
+if (check_max_fee || check_max_feerate || broadcast_method == TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST) {
+    // First, call ATMP with test_accept and check the fee. If ATMP fails here, return error immediately.
+    const MempoolAcceptResult result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);
+    if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+        return HandleATMPError(result.m_state, err_string);
+    } else if (check_max_fee && result.m_base_fees.value() > max_tx_fee) {
+        return TransactionError::MAX_FEE_EXCEEDED;
+    } else if (check_max_feerate && result.m_base_fees.value() > max_tx_fee_rate.GetFee(result.m_vsize.value())) {
+        return TransactionError::MAX_FEE_RATE_EXCEEDED;
+    }
+}
+
+switch (broadcast_method) {
+case TxBroadcast::MEMPOOL_NO_BROADCAST:
+case TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL:
+    {
+        const MempoolAcceptResult result = node.chainman->ProcessTransaction(tx, /*test_accept=*/false);
+        if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+            return HandleATMPError(result.m_state, err_string);
+        }
+    }
+    if (broadcast_method == TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL) {
+        // the mempool tracks locally submitted transactions to make a
+        // best-effort of initial broadcast
+        node.mempool->AddUnbroadcastTx(txid);
+    }
+    break;
+// ...
+}
+----
+
+The dry run exists so that a fee that exceeds the user's cap is reported *before*
+the transaction is actually accepted, rather than leaving it sitting in the mempool
+after an error return. It means the validation pipeline below may run twice.
+
+`AddUnbroadcastTx` records that this transaction originated locally and has not yet
+been seen echoed back from the network, so the node can retry announcing it — the
+mechanism that stops a locally-created transaction from being silently dropped if
+the first announcement goes nowhere.
+
+Finally, `wait_callback` causes a `SyncWithValidationInterfaceQueue()` before
+returning, so that the wallet has already been notified via `ValidationSignals` by
+the time the RPC responds. Without it, calling `sendrawtransaction` and then
+immediately querying the wallet could return stale state — the deferred-callback
+design from 1.0 made visible at the API surface.
+
+Then the handoff to the network layer:
+
+[source,cpp]
+----
+switch (broadcast_method) {
+case TxBroadcast::MEMPOOL_NO_BROADCAST:
+    break;
+case TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL:
+    node.peerman->InitiateTxBroadcastToAll(wtxid);
+    break;
+case TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST:
+    return node.peerman->InitiateTxBroadcastPrivate(tx);
+}
+----
+
+`InitiateTxBroadcastToAll` is the current name for what older code and the 2021
+onboarding text call `RelayTransaction`.
+
+== Stage 5 — Mempool acceptance
+
+{repo}/src/validation.cpp[`ChainstateManager::ProcessTransaction`] is thin:
+
+[source,cpp]
+----
+MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept)
+{
+    AssertLockHeld(cs_main);
+    Chainstate& active_chainstate = ActiveChainstate();
+    if (!active_chainstate.GetMempool()) {
+        TxValidationState state;
+        state.Invalid(TxValidationResult::TX_NO_MEMPOOL, "no-mempool");
+        return MempoolAcceptResult::Failure(state);
+    }
+    auto result = AcceptToMemoryPool(active_chainstate, tx, GetTime(), /*bypass_limits=*/ false, test_accept);
+    active_chainstate.GetMempool()->check(active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1);
+    return result;
+}
+----
+
+Note `ActiveChainstate()` — with assumeutxo there may be two chainstates, and
+transactions are only ever validated against the active one.
+
+The substance is
+{repo}/src/validation.cpp#L1313[`MemPoolAccept::AcceptSingleTransactionInternal`],
+which runs checks in increasing order of cost. The comment in the middle of it is
+the design principle in one line:
+
+[source,cpp]
+----
+// Perform the inexpensive checks first and avoid hashing and signature verification unless
+// those checks pass, to mitigate CPU exhaustion denial-of-service attacks.
+if (!PolicyScriptChecks(ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+if (!ConsensusScriptChecks(ws)) return MempoolAcceptResult::Failure(ws.m_state);
+----
+
+The full order:
+
+. {repo}/src/validation.cpp#L779[`PreChecks`] — `CheckTransaction` (context-free
+  consensus checks), standardness via `IsStandardTx`, TRUC topology rules for
+  version 3, input availability against `m_view`, fee calculation, conflict
+  detection. A failure here may be classified `TX_RECONSIDERABLE`, meaning the
+  transaction was rejected for fee reasons alone and could still succeed as part of
+  a package — the hook that makes package relay and CPFP work.
+. `ReplacementChecks` — only when conflicts were found, i.e. this is an RBF
+  replacement.
+. `m_subpackage.m_changeset->CheckMemPoolPolicyLimits()` — the cluster limit from
+  1.1. This is checked *before* ancestor calculations, with an explicit comment
+  saying so, because cluster membership bounds the work the ancestor calculation
+  can do.
+. `EntriesAndTxidsDisjoint` — a transaction may not both spend from and conflict
+  with the same ancestor. Classified `TX_CONSENSUS` because such a state would be
+  internally inconsistent.
+. `CheckEphemeralSpends` — the ephemeral dust policy from 1.1.
+. `PolicyScriptChecks`, then `ConsensusScriptChecks` — scripts under policy flags,
+  then again under consensus flags with the result cached. This is where
+  `CheckInputScripts` and the `ValidationCache` from 1.0 come in. For a single
+  mempool transaction `pvChecks` is null, so checks run inline rather than being
+  queued to the `scriptch.NN` workers; parallel script checking is a
+  block-validation optimisation only.
+. If `test_accept`, return here without inserting — this is the dry run from stage 4,
+  and also what `testmempoolaccept` exposes.
+. `FinalizeSubpackage` → {repo}/src/validation.cpp#L1185[`m_subpackage.m_changeset->Apply()`],
+  which is where {repo}/src/txmempool.cpp#L229[`CTxMemPool::addNewTransaction`]
+  actually inserts the entry and registers it with `TxGraph`.
+. `LimitMempoolSize` — eviction if the mempool is now over `-maxmempool`. The
+  transaction can be evicted immediately after being added, in which case the
+  result is downgraded to `TX_RECONSIDERABLE` with reason "mempool full".
+
+Finally, the notification:
+
+[source,cpp]
+----
+if (m_pool.m_opts.signals) {
+    const CTransaction& tx = *ws.m_ptx;
+    auto iter = m_pool.GetIter(tx.GetHash());
+    Assume(iter.has_value());
+    const auto tx_info = NewMempoolTransactionInfo(ws.m_ptx, ws.m_base_fees, ws.m_vsize, ...);
+    m_pool.m_opts.signals->TransactionAddedToMempool(tx_info, m_pool.GetAndIncrementSequence());
+}
+----
+
+`TransactionAddedToMempool` is the `ValidationSignals` event from 1.0. Its
+subscribers — the wallet (via `NotificationsProxy`), ZMQ, the fee estimator — are
+notified asynchronously on the `b-scheduler` thread. The mempool *sequence number*
+incremented here matters for the next stage: it is how the node decides which
+GETDATA requests it is willing to serve.
+
+== Stage 6 — Announcement: the inv backlog
+
+This is the part that has changed most since the 2021 onboarding text, and it is
+worth understanding because it is not simply a queue.
+
+{repo}/src/net_processing.cpp#L2489[`InitiateTxBroadcastToAll`] does not touch
+peers at all:
+
+[source,cpp]
+----
+void PeerManagerImpl::InitiateTxBroadcastToAll(const Wtxid& wtxid)
+{
+    {
+        LOCK(m_inv_to_send_mutex);
+        m_inbound_inv_bucket.backlog.push_back(wtxid);
+        m_outbound_inv_bucket.backlog.push_back(wtxid);
+    }
+    ProcessInvBacklog(NodeClock::now(), /*backlog_bumped=*/true);
+}
+----
+
+There are two *global* backlogs — one for inbound peers, one for outbound — each
+governed by a token bucket. {repo}/src/net_processing.cpp#L507[`InvToSendBucket`]:
+
+[source,cpp]
+----
+struct InvToSendBucket {
+    const double count_floor{0};
+    std::vector<Wtxid> backlog;
+    util::TokenBucket<NodeClock> size_bucket;
+    util::TokenBucket<NodeClock> count_bucket;
+
+    static constexpr double SIZE_INIT{12'000'000}; // 12 MB initially
+    static constexpr double SIZE_CAP{50'000'000};  // 50 MB maximum
+    static constexpr double SIZE_REFILL{20'000};   // 20kB/s = 12MB/600s
+
+    static constexpr double INBOUND_COUNT_SECONDS{30};
+    // ...
+};
+----
+
+Two buckets per direction — one limiting the *count* of announcements, one limiting
+their total *size* — with the size bucket refilling at roughly six times the rate
+at which blocks can confirm transactions. The header comment explains the
+calibration: high enough not to trigger on normal spikes, but with a modest initial
+value so that frequent restarts cannot be used to raise the effective limit.
+
+{repo}/src/net_processing.cpp#L2409[`ProcessInvBacklog`] drains the backlogs into
+per-peer queues:
+
+[source,cpp]
+----
+std::vector<Wtxid> for_inbound;
+std::vector<Wtxid> for_outbound;
+{
+    LOCK(m_mempool.cs);
+    if (in_avail) for_inbound = m_inbound_inv_bucket.TakeForProcessing(m_mempool);
+    if (out_avail) for_outbound = m_outbound_inv_bucket.TakeForProcessing(m_mempool);
+}
+
+for (const PeerRef& peer_ref : GetAllPeers()) {
+    // ...
+    LOCK(tx_relay->m_tx_inventory_mutex);
+    // Only queue transactions for announcement once the version handshake
+    // is completed. The time of arrival for these transactions is
+    // otherwise at risk of leaking to a spy, if the spy is able to
+    // distinguish transactions received during the handshake from the rest
+    // in the announcement.
+    if (tx_relay->m_next_inv_send_time == 0s) continue;
+    // ...
+    for (auto& i : (peer.m_is_inbound ? for_inbound : for_outbound)) {
+        tx_relay->m_tx_inventory_to_send.push_back(i);
+    }
+}
+----
+
+That comment is characteristic of this whole subsystem: nearly every design choice
+here is driven by what a network observer could infer about where a transaction
+originated.
+
+== Stage 7 — Sending the `INV`
+
+The per-peer queue is drained in `SendMessages`, still on `b-msghand`. Each peer has
+its own randomised send timer:
+
+[source,cpp]
+----
+if (tx_relay->m_next_inv_send_time < current_time) {
+    fSendTrickle = true;
+    if (node.IsInboundConn()) {
+        tx_relay->m_next_inv_send_time = NextInvToInbounds(current_time, INBOUND_INVENTORY_BROADCAST_INTERVAL, node.m_network_key);
+    } else {
+        tx_relay->m_next_inv_send_time = current_time + m_rng.rand_exp_duration(OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+    }
+}
+----
+
+The intervals are {repo}/src/net_processing.cpp#L172[5s for inbound and 2s for
+outbound] peers, and the delays are drawn from an exponential distribution — a
+Poisson process. The asymmetry is deliberate: inbound peers are unsolicited and
+more likely to be adversarial, so they learn about transactions more slowly, and
+`NextInvToInbounds` makes the timer shared across inbound peers so they cannot
+triangulate origin by comparing arrival times. Outbound peers, which you chose, get
+faster independent timers.
+
+Then the actual message:
+
+[source,cpp]
+----
+for (auto& tx : inv_tx) {
+    // `TxRelay::m_tx_inventory_known_filter` contains either txids or wtxids
+    // depending on whether our peer supports wtxid-relay. Therefore, first
+    // construct the inv and then use its hash for the filter check.
+    const auto inv = peer.m_wtxid_relay ?
+                         CInv{MSG_WTX, tx->GetWitnessHash().ToUint256()} :
+                         CInv{MSG_TX, tx->GetHash().ToUint256()};
+    if (tx_relay->m_tx_inventory_known_filter.contains(inv.hash)) continue;
+    if (tx_relay->m_bloom_filter && !tx_relay->m_bloom_filter->IsRelevantAndUpdate(*tx)) continue;
+    vInv.push_back(inv);
+    if (vInv.size() == MAX_INV_SZ) {
+        MakeAndPushMessage(node, NetMsgType::INV, vInv);
+        vInv.clear();
+    }
+    tx_relay->m_tx_inventory_known_filter.insert(inv.hash);
+}
+----
+
+`m_tx_inventory_known_filter` is a rolling Bloom filter of what this peer already
+knows, so the same transaction is not announced to the same peer twice.
+`m_last_inv_sequence` is updated just above to the current mempool sequence —
+recording that this node has committed to serving anything it just announced.
+
+`MakeAndPushMessage` serialises and hands off to `CConnman`, where
+{repo}/src/net.cpp#L4203[`CConnman::PushMessage`] applies the `V1Transport` or
+`V2Transport` framing from 1.1 and queues the bytes. The `b-net` socket handler
+thread writes them.
+
+The transaction has left the node.
+
+== Stage 8 — The peer receives the `INV`
+
+On the receiving node, now on *its* `b-msghand` thread, in `ProcessMessage`:
+
+[source,cpp]
+----
+if (msg_type == NetMsgType::INV) {
+    std::vector<CInv> vInv;
+    vRecv >> vInv;
+    if (vInv.size() > MAX_INV_SZ)
+    {
+        Misbehaving(peer, strprintf("inv message size = %u", vInv.size()));
+        return;
+    }
+    // ...
+    } else if (inv.IsGenTxMsg()) {
+        // ...
+        const GenTxid gtxid = ToGenTxid(inv);
+        AddKnownTx(peer, inv.hash);
+
+        if (!m_chainman.IsInitialBlockDownload()) {
+            const bool fAlreadyHave{m_txdownloadman.AddTxAnnouncement(pfrom.GetId(), gtxid, current_time)};
+            LogDebug(BCLog::NET, "got inv: %s %s peer=%d", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
+        }
+    }
+----
+
+Note the `Misbehaving` call — this is one of the surviving call sites after the
+scoring system was removed (see 1.1); an oversized `INV` now means immediate
+discouragement, not 20 points.
+
+A node in initial block download ignores transaction announcements entirely: it has
+no reliable UTXO set to validate against yet.
+
+{repo}/src/node/txdownloadman.h#L136[`TxDownloadManager::AddTxAnnouncement`] records
+that this peer has the transaction and decides whether and when to request it. It
+deduplicates against the mempool, the orphanage, the recent-rejects filters, and
+announcements from other peers, and it staggers requests so that an adversary
+announcing a transaction cannot force the node to fetch it from them specifically.
+
+== Stage 9 — `GETDATA`
+
+Back in `SendMessages`, the request is issued:
+
+[source,cpp]
+----
+//
+// Message: getdata (transactions)
+//
+{
+    LOCK(m_tx_download_mutex);
+    for (const GenTxid& gtxid : m_txdownloadman.GetRequestsToSend(node.GetId(), current_time)) {
+        vGetData.emplace_back(gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer)), gtxid.ToUint256());
+        if (vGetData.size() >= MAX_GETDATA_SZ) {
+            MakeAndPushMessage(node, NetMsgType::GETDATA, vGetData);
+            vGetData.clear();
+        }
+    }
+}
+----
+
+{repo}/src/node/txdownloadman.h#L139[`GetRequestsToSend`] is what enforces the
+scheduling policy — which peer to ask, preferring outbound, and when to time out and
+try another.
+
+== Stage 10 — Serving the transaction
+
+Back on the original node. `ProcessGetData` runs *before* the main message dispatch
+in `ProcessMessages`, so pending requests are drained first.
+
+{repo}/src/net_processing.cpp#L2742[`FindTxForGetData`] decides whether to serve it:
+
+[source,cpp]
+----
+CTransactionRef PeerManagerImpl::FindTxForGetData(const Peer::TxRelay& tx_relay, const GenTxid& gtxid)
+{
+    // If a tx was in the mempool prior to the last INV for this peer, permit the request.
+    auto txinfo{std::visit(
+        [&](const auto& id) {
+            return m_mempool.info_for_relay(id, WITH_LOCK(tx_relay.m_tx_inventory_mutex,
+                                                          return tx_relay.m_last_inv_sequence));
+        },
+        gtxid)};
+    if (txinfo.tx) {
+        return std::move(txinfo.tx);
+    }
+
+    // Or it might be from the most recent block
+    {
+        LOCK(m_most_recent_block_mutex);
+        if (m_most_recent_block_txs != nullptr) {
+            auto it = m_most_recent_block_txs->find(gtxid);
+            if (it != m_most_recent_block_txs->end()) return it->second;
+        }
+    }
+
+    return {};
+}
+----
+
+This is the other half of the `m_last_inv_sequence` bookkeeping from stage 7. The
+node serves a transaction to a peer only if it was in the mempool at or before the
+last `INV` sent to *that* peer. An attacker cannot probe the mempool by requesting
+arbitrary txids — the only thing they can learn is what they were already told.
+
+Then:
+
+[source,cpp]
+----
+if (auto tx{FindTxForGetData(*tx_relay, ToGenTxid(inv))}) {
+    // WTX and WITNESS_TX imply we serialize with witness
+    const auto maybe_with_witness = (inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS);
+    MakeAndPushMessage(pfrom, NetMsgType::TX, maybe_with_witness(*tx));
+    m_mempool.RemoveUnbroadcastTx(tx->GetHash());
+} else {
+    vNotFound.push_back(inv);
+}
+----
+
+`RemoveUnbroadcastTx` closes the loop opened by `AddUnbroadcastTx` in stage 4: the
+transaction has now demonstrably reached at least one peer, so the node stops
+retrying its initial broadcast.
+
+== Stage 11 — The peer receives the `TX`
+
+[source,cpp]
+----
+if (msg_type == NetMsgType::TX) {
+    if (RejectIncomingTxs(pfrom)) {
+        LogDebug(BCLog::NET, "transaction sent in violation of protocol, %s", pfrom.DisconnectMsg());
+        pfrom.fDisconnect = true;
+        return;
+    }
+
+    // Stop processing the transaction early if we are still in IBD since we don't
+    // have enough information to validate it yet. Sending unsolicited transactions
+    // is not considered a protocol violation, so don't punish the peer.
+    if (m_chainman.IsInitialBlockDownload()) return;
+
+    CTransactionRef ptx;
+    vRecv >> TX_WITH_WITNESS(ptx);
+    // ...
+    LOCK2(cs_main, m_tx_download_mutex);
+
+    const auto& [should_validate, package_to_validate] = m_txdownloadman.ReceivedTx(pfrom.GetId(), ptx);
+    if (!should_validate) {
+        // ... forcerelay handling, package validation ...
+        return;
+    }
+
+    const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);
+    const TxValidationState& state = result.m_state;
+
+    if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
+        ProcessValidTx(pfrom.GetId(), ptx, result.m_replaced_transactions);
+        pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();
+    }
+----
+
+Note the contrast in how the two early exits are handled. A transaction from a
+block-relay-only peer is a protocol violation and gets a disconnect; an unsolicited
+transaction during IBD is merely useless and is dropped silently. The comment makes
+the distinction explicit.
+
+{repo}/src/node/txdownloadman.h#L156[`ReceivedTx`] clears the in-flight request and
+decides whether this transaction should be validated alone or assembled into a
+package with a previously-orphaned child.
+
+== Stage 12–13 — Acceptance on the peer
+
+`m_chainman.ProcessTransaction(ptx)` is the same call as stage 5, running the same
+`MemPoolAccept` pipeline, on the peer's own chainstate and against its own policy
+settings. This is the crux of the system: the peer re-validates everything from
+scratch. Nothing about the transaction having arrived from a particular peer, or
+having been accepted elsewhere, grants it any standing.
+
+Policy differences are entirely legitimate here. If your node relays a transaction
+that is below the peer's `-minrelaytxfee`, or exceeds its `-limitclustercount`, or
+violates a datacarrier setting it has configured differently, the peer rejects it
+while your own node holds it quite happily. Consensus is uniform; policy is not.
+
+On success the transaction is inserted and
+`TransactionAddedToMempool` fires on the peer's `b-scheduler` thread.
+
+**This is the end state the trace was aiming for.** The transaction exists in a
+second node's mempool, validated independently.
+
+== Stage 14 — Onward propagation
+
+The peer immediately re-enters stage 6 on its own behalf:
+
+[source,cpp]
+----
+void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef& tx,
+                                     const std::list<CTransactionRef>& replaced_transactions)
+{
+    AssertLockNotHeld(m_peer_mutex);
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(m_tx_download_mutex);
+
+    m_txdownloadman.MempoolAcceptedTx(tx);
+
+    LogDebug(BCLog::MEMPOOL, "AcceptToMemoryPool: peer=%d: accepted %s (wtxid=%s) (poolsz %u txn, %u kB)\n",
+             nodeid, tx->GetHash().ToString(), tx->GetWitnessHash().ToString(),
+             m_mempool.size(), m_mempool.DynamicMemoryUsage() / 1000);
+
+    InitiateTxBroadcastToAll(tx->GetWitnessHash());
+
+    for (const CTransactionRef& removedTx : replaced_transactions) {
+        AddToCompactExtraTransactions(removedTx);
+    }
+}
+----
+
+`InitiateTxBroadcastToAll` — the same function the originating node called in stage
+4. The gossip is recursive, and from here the transaction spreads across the network
+by repetition of stages 6 through 13. No node can tell, from the propagation
+pattern alone, which of its peers originated it.
+
+Replaced transactions are kept in the compact-block extra pool, so that if a miner
+confirms the replacement, reconstruction of the compact block does not require a
+round trip.
+
+[[wallet-path]]
+== Appendix A: the wallet path
+
+A `sendtoaddress` call reaches stage 4 by a different route:
+
+....
+sendtoaddress / send                       wallet/rpc/spend.cpp
+  └─ CreateTransaction                     wallet/spend.cpp
+       ├─ AvailableCoins                   which UTXOs are spendable
+       ├─ SelectCoins                      wallet/coinselection.cpp
+       │    └─ branch and bound / knapsack / SRD
+       ├─ fee estimation                   via interfaces::Chain → CBlockPolicyEstimator
+       ├─ change output + CChangeDestination
+       └─ SignTransaction                  wallet/scriptpubkeyman.cpp
+            └─ DescriptorScriptPubKeyMan::SignTransaction
+                 └─ ProduceSignature       ← same function as stage 2
+  └─ CWallet::CommitTransaction            wallet/wallet.cpp
+       └─ chain().broadcastTransaction()   interfaces::Chain
+            └─ BroadcastTransaction        ← stage 4, identical from here
+....
+
+The difference is entirely in stages 1 and 2: the wallet chooses the inputs,
+computes a fee from an estimate rather than accepting whatever the user implies,
+and adds a change output. It converges on exactly the same `ProduceSignature` and
+the same `BroadcastTransaction`. Note also that the wallet never calls the fee
+estimator directly — it goes through `interfaces::Chain`, for the reasons set out
+in 1.1.
+
+== Appendix B: observing this yourself
+
+The cleanest way to watch the whole path is two signet or regtest nodes:
+
+[source,bash]
+----
+# Terminal 1
+bitcoin node -signet -debug=net -debug=mempool -debug=txpackages
+
+# Terminal 2 — a second datadir, connected to the first
+bitcoin node -signet -datadir=/tmp/n2 -port=39333 -rpcport=39332 \
+             -connect=127.0.0.1:38333 -debug=net -debug=mempool
+----
+
+Useful breakpoints, in trace order:
+
+[cols="2,3",options="header"]
+|===
+| Function | Shows you
+
+| `ConstructTransaction`
+| the `CMutableTransaction` before anything touches it
+
+| `ProduceSignature`
+| per-input satisfaction, including partial results
+
+| `BroadcastTransaction`
+| the `TxBroadcast` branch actually taken
+
+| `MemPoolAccept::PreChecks`
+| why a transaction is rejected, before any script work
+
+| `PeerManagerImpl::InitiateTxBroadcastToAll`
+| entry into the backlog
+
+| `PeerManagerImpl::ProcessInvBacklog`
+| the token buckets draining
+
+| `PeerManagerImpl::FindTxForGetData`
+| the sequence-number gate on serving
+
+| `PeerManagerImpl::ProcessValidTx`
+| the peer re-announcing
+|===
+
+`-debug=net` logs the backlog heartbeat (`Transaction rate-limiting backlog
+inbound=… itok=… isz=…`), which is the easiest way to see the rate limiter working
+without attaching a debugger. The USDT tracepoints under
+{repo}/doc/tracing.md[`doc/tracing.md`] cover several of these points if you would
+rather watch a running node than stop it.
+
+== References
+
+* {repo}/doc/policy[`doc/policy/`] — mempool design, terminology, replacement rules,
+  package relay
+* {repo}/doc/design/libraries.md[`doc/design/libraries.md`]
+* {repo}/doc/tracing.md[`doc/tracing.md`] — USDT tracepoints, including
+  `net:misbehaving_connection`
+* {repo}/src/node/txdownloadman.h[`src/node/txdownloadman.h`] — the header comments
+  are the best available documentation of transaction request scheduling
+* https://bitcoincore.reviews[Bitcoin Core PR Review Club] — several sessions cover
+  the inv-bucket redesign and package relay specifically
+* BIP125 (RBF), BIP133 (feefilter), BIP339 (wtxid relay), BIP341 (taproot sighash),
+  BIP431 (TRUC)
+
+[NOTE]
+====
+Verification note: every function name, line anchor, constant and code excerpt above
+was read from the tree at `4303f3b7f0775cdbbe77faddf142e1e44fa590ca` rather than
+recalled. Excerpts are abridged — `// ...` marks elisions — and are reproduced under
+Bitcoin Core's MIT licence for technical explanation. The inv-backlog machinery in
+stage 6 is recent and still settling; its constants in particular are more likely to
+move than anything else in this trace.
+====
